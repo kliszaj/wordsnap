@@ -1,0 +1,539 @@
+WordSnap A/B results 20260707-230307
+Clip order: 005 skjorta, 006 kvitto, 007 skynda, 008 låtsas, 009 besviken, 010 krånglig, 011 förmodligen, 012 lagom, 013 skärgård, 014 rimlig-context
+
+
+################################################################################
+### test-clips\rec_005.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_005.wav
+
+Transcript
+------------------------------------------------------------------------------
+En h�rta.
+
+Clip metadata: capture_timestamp=1980-01-01T00:45:32+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+Traceback (most recent call last):
+  File "C:\Users\Adrian\Documents\Coding\wordclip\backend\compare.py", line 171, in <module>
+    main()
+  File "C:\Users\Adrian\Documents\Coding\wordclip\backend\compare.py", line 161, in main
+    print_card(f"Claude ({claude_model})", claude_card, capture_timestamp, iso_week)
+  File "C:\Users\Adrian\Documents\Coding\wordclip\backend\compare.py", line 77, in print_card
+    **model_to_dict(card),
+      ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\Adrian\Documents\Coding\wordclip\backend\compare.py", line 70, in model_to_dict
+    return model.model_dump(mode="json", exclude_none=True, by_alias=True)
+           ^^^^^^^^^^^^^^^^
+AttributeError: 'NoneType' object has no attribute 'model_dump'
+
+
+################################################################################
+### test-clips\rec_006.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_006.wav
+
+Transcript
+------------------------------------------------------------------------------
+Ett kvitto.
+
+Clip metadata: capture_timestamp=1980-01-01T00:45:44+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:45:44+01:00
+iso_week: 2026-W28
+raw_input: Ett kvitto.
+corrected_word: kvitto
+english_definition: receipt
+swedish_definition: ett papper eller digitalt dokument som bekr�ftar ett k�p eller en betalning
+part_of_speech: substantiv
+gender: ett
+forms: ett kvitto, kvittot, kvitton, kvittona
+example_sentence_sv: Kan jag f� ett kvitto p� k�pet, tack?
+example_sentence_en: Can I get a receipt for the purchase, please?
+register: neutral
+collocations:
+  - spara kvittot
+  - beg�ra ett kvitto
+  - kvitto p� k�pet
+  - digitalt kvitto
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:45:44+01:00
+iso_week: 2026-W28
+raw_input: Ett kvitto.
+corrected_word: kvitto
+english_definition: receipt
+swedish_definition: ett skriftligt eller digitalt bevis p� att man har betalat f�r n�got
+part_of_speech: substantiv
+gender: ett
+forms: ett kvitto, kvittot, kvitton, kvittona
+example_sentence_sv: Gl�m inte att spara kvittot om du beh�ver l�mna tillbaka varan.
+example_sentence_en: Don�t forget to save the receipt in case you need to return the item.
+register: neutral
+collocations:
+  - spara kvittot
+  - visa upp ett kvitto
+  - f� ett kvitto
+  - digitalt kvitto
+
+
+################################################################################
+### test-clips\rec_007.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_007.wav
+
+Transcript
+------------------------------------------------------------------------------
+att skynda.
+
+Clip metadata: capture_timestamp=1980-01-01T00:45:58+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:45:58+01:00
+iso_week: 2026-W28
+raw_input: att skynda.
+corrected_word: skynda
+english_definition: to hurry, to rush
+swedish_definition: att g�ra n�got snabbt eller bege sig n�gonstans fort, ofta f�r att inte bli sen
+part_of_speech: verb
+forms: att skynda, skyndar, skyndade, skyndat
+example_sentence_sv: Vi m�ste skynda oss om vi ska hinna med t�get.
+example_sentence_en: We have to hurry if we're going to catch the train.
+register: neutral
+collocations:
+  - skynda sig
+  - skynda p�
+  - skynda till hj�lp
+  - skynda iv�g
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:45:58+01:00
+iso_week: 2026-W28
+raw_input: att skynda.
+corrected_word: skynda
+english_definition: to hurry, to rush
+swedish_definition: att g�ra n�got snabbt eller r�ra sig fort f�r att hinna i tid
+part_of_speech: verb
+forms: att skynda, skyndar, skyndade, skyndat
+example_sentence_sv: Vi m�ste skynda oss om vi ska hinna med bussen.
+example_sentence_en: We need to hurry if we�re going to catch the bus.
+register: neutral
+collocations:
+  - skynda sig
+  - skynda p�
+  - skynda l�ngsamt
+  - skynda hem
+
+
+################################################################################
+### test-clips\rec_008.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_008.wav
+
+Transcript
+------------------------------------------------------------------------------
+att l�tsas.
+
+Clip metadata: capture_timestamp=1980-01-01T00:46:10+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:10+01:00
+iso_week: 2026-W28
+raw_input: att l�tsas.
+corrected_word: l�tsas
+english_definition: to pretend, to fake
+swedish_definition: att bete sig som om n�got �r sant eller verkligt fast det inte �r det
+part_of_speech: verb
+forms: att l�tsas, l�tsas, l�tsades, l�tsats
+example_sentence_sv: Barnen l�tsades vara superhj�ltar hela eftermiddagen.
+example_sentence_en: The children pretended to be superheroes all afternoon.
+register: neutral
+collocations:
+  - l�tsas som ingenting
+  - l�tsas sova
+  - l�tsas vara
+  - bara l�tsas
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:10+01:00
+iso_week: 2026-W28
+raw_input: att l�tsas.
+corrected_word: l�tsas
+english_definition: to pretend
+swedish_definition: att upptr�da som om n�got vore sant fast det inte �r det
+part_of_speech: verb
+forms: att l�tsas, l�tsas, l�tsades, l�tsats
+example_sentence_sv: Han l�tsades inte h�ra vad jag sa.
+example_sentence_en: He pretended not to hear what I said.
+register: neutral
+collocations:
+  - l�tsas som ingenting
+  - l�tsas vara sjuk
+  - l�tsas att man f�rst�r
+  - bara l�tsas
+
+
+################################################################################
+### test-clips\rec_009.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_009.wav
+
+Transcript
+------------------------------------------------------------------------------
+Besviken
+
+Clip metadata: capture_timestamp=1980-01-01T00:46:22+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:22+01:00
+iso_week: 2026-W28
+raw_input: Besviken
+corrected_word: besviken
+english_definition: disappointed
+swedish_definition: Som k�nner sorg eller missn�je f�r att n�got inte blev som man hoppats eller f�rv�ntat sig.
+part_of_speech: adjektiv
+example_sentence_sv: Hon blev besviken n�r festen st�lldes in.
+example_sentence_en: She was disappointed when the party was cancelled.
+register: neutral
+collocations:
+  - bli besviken p�
+  - besviken �ver
+  - djupt besviken
+  - besviken kund
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:22+01:00
+iso_week: 2026-W28
+raw_input: Besviken
+corrected_word: besviken
+english_definition: disappointed
+swedish_definition: ledsen eller missn�jd f�r att n�got inte blev som man hade hoppats.
+part_of_speech: adjektiv
+example_sentence_sv: Jag blev besviken n�r m�tet st�lldes in i sista minuten.
+example_sentence_en: I was disappointed that the meeting was canceled at the last minute.
+register: neutral
+collocations:
+  - bli besviken
+  - k�nna sig besviken
+  - besviken p� n�gon
+  - djupt besviken
+
+
+################################################################################
+### test-clips\rec_010.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_010.wav
+
+Transcript
+------------------------------------------------------------------------------
+Kr�nglig.
+
+Clip metadata: capture_timestamp=1980-01-01T00:46:34+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:34+01:00
+iso_week: 2026-W28
+raw_input: Kr�nglig.
+corrected_word: kr�nglig
+english_definition: complicated, troublesome, fussy
+swedish_definition: Som �r sv�r att hantera, f�rst� eller l�sa; besv�rlig eller invecklad.
+part_of_speech: adjektiv
+forms: kr�nglig, kr�ngligt, kr�ngliga
+example_sentence_sv: Datorn har blivit s� kr�nglig att jag m�ste starta om den flera g�nger om dagen.
+example_sentence_en: The computer has become so troublesome that I have to restart it several times a day.
+register: neutral
+collocations:
+  - en kr�nglig situation
+  - kr�nglig teknik
+  - vara kr�nglig
+  - kr�ngligt att f�rst�
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:34+01:00
+iso_week: 2026-W28
+raw_input: Kr�nglig.
+corrected_word: kr�nglig
+english_definition: complicated, troublesome, difficult to deal with
+swedish_definition: sv�r att f�rst� eller hantera; komplicerad och besv�rlig
+part_of_speech: adjektiv
+example_sentence_sv: Blanketten var s� kr�nglig att jag var tvungen att be om hj�lp.
+example_sentence_en: The form was so complicated that I had to ask for help.
+register: neutral
+collocations:
+  - en kr�nglig process
+  - kr�ngliga regler
+  - kr�ngligt att f�rst�
+  - g�ra det kr�ngligt
+
+
+################################################################################
+### test-clips\rec_011.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_011.wav
+
+Transcript
+------------------------------------------------------------------------------
+F�rm�gorligen.
+
+Clip metadata: capture_timestamp=1980-01-01T00:46:48+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:48+01:00
+iso_week: 2026-W28
+raw_input: F�rm�gorligen.
+corrected_word: f�rmodligen
+english_definition: probably, presumably
+swedish_definition: Ett adverb som anv�nds f�r att uttrycka att n�got �r sannolikt eller troligt, utan att vara helt s�kert.
+part_of_speech: adverb
+example_sentence_sv: Han kommer f�rmodligen f�r sent till m�tet igen.
+example_sentence_en: He will probably be late for the meeting again.
+register: neutral
+collocations:
+  - f�rmodligen inte
+  - ja, f�rmodligen
+  - det �r f�rmodligen b�st att�
+  - f�rmodligen den enda l�sningen
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:46:48+01:00
+iso_week: 2026-W28
+raw_input: F�rm�gorligen.
+corrected_word: f�rmodligen
+english_definition: probably, likely
+swedish_definition: sannolikt; troligen
+part_of_speech: adverb
+example_sentence_sv: Hon kommer f�rmodligen lite sent eftersom tunnelbanan �r f�rsenad.
+example_sentence_en: She�ll probably come a little late because the subway is delayed.
+register: neutral
+collocations:
+  - f�rmodligen inte
+  - f�rmodligen kommer att
+  - det beror f�rmodligen p�
+  - �r f�rmodligen
+
+
+################################################################################
+### test-clips\rec_012.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_012.wav
+
+Transcript
+------------------------------------------------------------------------------
+Lagom.
+
+Clip metadata: capture_timestamp=1980-01-01T00:47:00+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:00+01:00
+iso_week: 2026-W28
+raw_input: Lagom.
+corrected_word: lagom
+english_definition: just right, not too much and not too little; moderate, sufficient
+swedish_definition: varken f�r mycket eller f�r lite; precis r�tt m�ngd eller grad av n�got
+part_of_speech: adverb
+example_sentence_sv: Kaffet var lagom starkt, precis som jag gillar det.
+example_sentence_en: The coffee was just right, exactly how I like it.
+register: neutral
+collocations:
+  - lagom stor
+  - lagom mycket
+  - lagom varmt
+  - det �r lagom
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:00+01:00
+iso_week: 2026-W28
+raw_input: Lagom.
+corrected_word: lagom
+english_definition: just right; moderate; enough
+swedish_definition: Varken f�r mycket eller f�r lite; i en passande m�ngd eller grad.
+part_of_speech: adjektiv/adverb
+example_sentence_sv: Kaffet �r lagom varmt.
+example_sentence_en: The coffee is just the right temperature.
+register: neutral
+collocations:
+  - lagom mycket
+  - lagom stor
+  - lagom varmt
+  - alldeles lagom
+
+
+################################################################################
+### test-clips\rec_013.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_013.wav
+
+Transcript
+------------------------------------------------------------------------------
+Sj�g�rd
+
+Clip metadata: capture_timestamp=1980-01-01T00:47:12+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:12+01:00
+iso_week: 2026-W28
+raw_input: Sj�g�rd
+corrected_word: sj�g�rd
+english_definition: a farm or estate located by a lake
+swedish_definition: en g�rd eller bebyggelse som ligger vid en sj�
+part_of_speech: substantiv
+gender: en
+forms: en sj�g�rd, sj�g�rden, sj�g�rdar, sj�g�rdarna
+example_sentence_sv: De k�pte en gammal sj�g�rd med utsikt �ver vattnet.
+example_sentence_en: They bought an old lakeside farm with a view of the water.
+register: neutral
+collocations:
+  - k�pa en sj�g�rd
+  - gammal sj�g�rd
+  - sj�g�rd vid sj�n
+  - bo p� en sj�g�rd
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:12+01:00
+iso_week: 2026-W28
+raw_input: Transcript: 'Sj�g�rd'
+corrected_word: sk�rg�rd
+english_definition: archipelago; group of islands near a coast
+swedish_definition: omr�de vid en kust med m�nga �ar, holmar och vatten emellan
+part_of_speech: substantiv
+gender: en
+forms: en sk�rg�rd, sk�rg�rden, sk�rg�rdar, sk�rg�rdarna
+example_sentence_sv: Vi tog b�ten ut i Stockholms sk�rg�rd i helgen.
+example_sentence_en: We took the boat out into the Stockholm archipelago over the weekend.
+register: neutral
+collocations:
+  - Stockholms sk�rg�rd
+  - �ka ut i sk�rg�rden
+  - bo i sk�rg�rden
+  - sk�rg�rds�
+
+
+################################################################################
+### test-clips\rec_014.wav
+################################################################################
+Transcribing with whisper-1: C:\Users\Adrian\Documents\Coding\wordclip\test-clips\rec_014.wav
+
+Transcript
+------------------------------------------------------------------------------
+Jag h�rde ordet rimligt p� jobbet.
+
+Clip metadata: capture_timestamp=1980-01-01T00:47:22+01:00, iso_week=2026-W28
+Note: clip mtime looks like an unset device clock. Use --capture-timestamp or --iso-week to override metadata.
+
+Running Claude enrichment with claude-sonnet-5...
+
+==============================================================================
+Claude (claude-sonnet-5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:22+01:00
+iso_week: 2026-W28
+raw_input: Jag h�rde ordet rimligt p� jobbet.
+corrected_word: rimlig
+english_definition: reasonable, fair
+swedish_definition: Som �r f�rnuftig, r�ttvis eller logisk utifr�n omst�ndigheterna.
+part_of_speech: adjektiv
+example_sentence_sv: Jag tycker att priset �r rimligt f�r den h�r kvaliteten.
+example_sentence_en: I think the price is reasonable for this quality.
+register: neutral
+collocations:
+  - ett rimligt pris
+  - en rimlig f�rklaring
+  - l�ter rimligt
+  - rimligt att anta
+context_note: h�rde ordet ... p� jobbet
+
+Running GPT enrichment with gpt-5.5...
+
+==============================================================================
+GPT (gpt-5.5)
+==============================================================================
+capture_timestamp: 1980-01-01T00:47:22+01:00
+iso_week: 2026-W28
+raw_input: Jag h�rde ordet rimligt p� jobbet.
+corrected_word: rimlig
+english_definition: reasonable, fair; plausible
+swedish_definition: som �r f�rnuftig, sk�lig eller m�jlig att acceptera
+part_of_speech: adjektiv
+example_sentence_sv: Det l�ter rimligt att v�nta till m�ndag innan vi best�mmer oss.
+example_sentence_en: It sounds reasonable to wait until Monday before we decide.
+register: neutral
+collocations:
+  - ett rimligt pris
+  - en rimlig chans
+  - rimliga krav
+  - Det l�ter rimligt.
+context_note: h�rde p� jobbet

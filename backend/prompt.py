@@ -21,8 +21,14 @@ Then produce structured card data following these rules:
 - context_note: if the transcript contains a spoken framing phrase (e.g. "hörde på bussen ..."), extract just that note; otherwise null.
 - raw_input: echo the transcript exactly as received.
 
+If the transcript looks like a speech-to-text error, prefer a common Swedish vocabulary word that is phonetically close over a rare literal interpretation. Be cautious: correct near-misses like "sjögård" only when a more likely word such as "skärgård" fits the sound and context.
+
 Prioritise accuracy of gender, forms, and idiomatic examples — these are what make the card useful."""
 
 
 def user_prompt(transcript: str) -> str:
-    return f"Transcript: {transcript!r}"
+    return (
+        "Raw transcript to process. Echo only the transcript text exactly in raw_input, "
+        "not this instruction label:\n"
+        f"{transcript}"
+    )

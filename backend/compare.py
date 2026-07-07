@@ -12,7 +12,7 @@ import argparse
 import os
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from dateutil.parser import isoparse
 from dotenv import load_dotenv
@@ -88,6 +88,26 @@ def print_card(title: str, card: BaseModel, capture_timestamp: str, iso_week: st
             print(f"{key}: {value}")
 
 
+def run_provider(
+    title: str,
+    func: Callable[[str], BaseModel | None],
+    transcript: str,
+    capture_timestamp: str,
+    iso_week: str,
+) -> None:
+    try:
+        card = func(transcript)
+    except Exception as exc:
+        print(f"\n{title} failed: {type(exc).__name__}: {exc}")
+        return
+
+    if card is None:
+        print(f"\n{title} returned no parsed card.")
+        return
+
+    print_card(title, card, capture_timestamp, iso_week)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compare Claude and GPT enrichment for one Wordclip WAV."
@@ -157,14 +177,24 @@ def main() -> None:
     if not args.skip_claude:
         require_env("ANTHROPIC_API_KEY")
         print(f"\nRunning Claude enrichment with {claude_model}...")
-        claude_card = enrich_with_claude(transcript, model=claude_model)
-        print_card(f"Claude ({claude_model})", claude_card, capture_timestamp, iso_week)
+        run_provider(
+            f"Claude ({claude_model})",
+            lambda text: enrich_with_claude(text, model=claude_model),
+            transcript,
+            capture_timestamp,
+            iso_week,
+        )
 
     if not args.skip_gpt:
         require_env("OPENAI_API_KEY")
         print(f"\nRunning GPT enrichment with {gpt_model}...")
-        gpt_card = enrich_with_gpt(transcript, model=gpt_model)
-        print_card(f"GPT ({gpt_model})", gpt_card, capture_timestamp, iso_week)
+        run_provider(
+            f"GPT ({gpt_model})",
+            lambda text: enrich_with_gpt(text, model=gpt_model),
+            transcript,
+            capture_timestamp,
+            iso_week,
+        )
 
 
 if __name__ == "__main__":
