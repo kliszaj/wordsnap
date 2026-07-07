@@ -1,0 +1,399 @@
+/*
+ * Wordclip capture-test firmware  --  Stage B
+ * Board: Waveshare ESP32-C6-Touch-LCD-1.83
+ *
+ *   - LCD status display (green ready / red+bar recording / white saved / magenta SD-fail)
+ *   - microSD (FAT32) over shared SPI2 bus
+ *   - BOOT button (GPIO9) -> record ~10s from the ES7210 dual-mic array -> WAV on SD
+ *
+ * Audio: ES7210 4-ch ADC (we use MIC1+MIC2), I2S TDM 2-slot, 16 kHz / 16-bit stereo.
+ * Pins (schematic Rev1.2 + Waveshare examples):
+ *   SPI2 shared: SCLK=1 MOSI=2 MISO=16 | LCD CS=5 DC=3 RST=4 BL=6 | SD CS=17
+ *   I2S:  MCLK=19 BCLK=20 WS=22 DIN=21 | Codec I2C: SDA=7 SCL=8 | ES7210 @ 0x40
+ */
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/gpio.h"
+#include "driver/spi_common.h"
+#include "driver/i2s_tdm.h"
+#include "driver/i2c_master.h"
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
+#include "driver/sdspi_host.h"
+#include "esp_codec_dev.h"
+#include "esp_codec_dev_defaults.h"
+#include "esp_log.h"
+#include "esp_check.h"
+#include "format_wav.h"
+
+static const char *TAG = "wordclip";
+
+/* ---- SPI / LCD / SD pins ---- */
+#define PIN_SCLK    1
+#define PIN_MOSI    2
+#define PIN_MISO    16
+#define PIN_LCD_CS  5
+#define PIN_LCD_DC  3
+#define PIN_LCD_RST 4
+#define PIN_LCD_BL  6
+#define PIN_SD_CS   17
+#define PIN_BTN     9          /* BOOT button, active-low */
+
+#define LCD_HOST    SPI2_HOST
+#define LCD_H_RES   240
+#define LCD_V_RES   284
+#define MOUNT_POINT "/sdcard"
+
+/* ---- audio (ES7210 via I2S TDM) ---- */
+#define I2C_PORT        I2C_NUM_0
+#define PIN_I2C_SDA     7
+#define PIN_I2C_SCL     8
+#define PIN_I2S_MCLK    19
+#define PIN_I2S_BCLK    20
+#define PIN_I2S_WS      22
+#define PIN_I2S_DIN     21
+
+#define SAMPLE_RATE     16000                 /* Whisper-native */
+#define SAMPLE_BITS     I2S_DATA_BIT_WIDTH_16BIT
+#define CHAN_NUM        2                     /* MIC1 + MIC2 */
+#define MIC_SELECTED    (ES7210_SEL_MIC1 | ES7210_SEL_MIC2)
+#define MIC_GAIN_DB     37.5f          /* ES7210 analog PGA near max; raise level for quiet capture */
+#define RECORD_SECONDS  10
+
+/* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
+#define C_WHITE   0xFFFF
+#define C_RED     0xF800
+#define C_GREEN   0x07E0
+#define C_BLUE    0x001F
+#define C_MAGENTA 0xF81F
+#define C_GREY    0x8410
+
+static esp_lcd_panel_handle_t s_panel = NULL;
+static bool s_sd_ok = false;
+static i2s_chan_handle_t s_i2s_rx = NULL;
+static esp_codec_dev_handle_t s_codec = NULL;
+
+static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
+
+/* ---------------- LCD ---------------- */
+static void lcd_fill(uint16_t color)
+{
+    static uint16_t line[LCD_H_RES];
+    uint16_t v = sw16(color);
+    for (int x = 0; x < LCD_H_RES; x++) line[x] = v;
+    for (int y = 0; y < LCD_V_RES; y++) {
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, line);
+    }
+}
+
+/* Progress-bar geometry */
+#define BAR_MARGIN 20
+#define BAR_W      (LCD_H_RES - 2 * BAR_MARGIN)
+#define BAR_Y      (LCD_V_RES / 2 - 18)
+#define BAR_H      36
+
+static int s_bar_filled;   /* px of the bar currently painted white */
+
+/* Paint the full red screen + empty (grey) bar ONCE, before recording starts.
+ * Kept off the audio read loop so it never starves the I2S DMA. */
+static void lcd_recording_begin(void)
+{
+    static uint16_t row[LCD_H_RES];
+    uint16_t bg = sw16(C_RED), rest = sw16(C_GREY);
+    for (int y = 0; y < LCD_V_RES; y++) {
+        bool in_bar = (y >= BAR_Y && y < BAR_Y + BAR_H);
+        for (int x = 0; x < LCD_H_RES; x++) {
+            row[x] = (in_bar && x >= BAR_MARGIN && x < BAR_MARGIN + BAR_W) ? rest : bg;
+        }
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, row);
+    }
+    s_bar_filled = 0;
+}
+
+/* Draw only the newly-filled slice of the bar (small transfer, cheap on the SPI bus). */
+static void lcd_recording_update(float frac)
+{
+    int fill_w = (int)(BAR_W * frac);
+    if (fill_w > BAR_W) fill_w = BAR_W;
+    if (fill_w <= s_bar_filled) return;
+
+    int slice_w = fill_w - s_bar_filled;
+    static uint16_t row[BAR_W];
+    uint16_t white = sw16(C_WHITE);
+    for (int x = 0; x < slice_w; x++) row[x] = white;
+
+    int x0 = BAR_MARGIN + s_bar_filled;
+    for (int y = BAR_Y; y < BAR_Y + BAR_H; y++) {
+        esp_lcd_panel_draw_bitmap(s_panel, x0, y, x0 + slice_w, y + 1, row);
+    }
+    s_bar_filled = fill_w;
+}
+
+static esp_err_t lcd_init(void)
+{
+    gpio_config_t bl = { .pin_bit_mask = 1ULL << PIN_LCD_BL, .mode = GPIO_MODE_OUTPUT };
+    ESP_ERROR_CHECK(gpio_config(&bl));
+    gpio_set_level(PIN_LCD_BL, 1);
+
+    esp_lcd_panel_io_handle_t io = NULL;
+    esp_lcd_panel_io_spi_config_t io_cfg = {
+        .cs_gpio_num = PIN_LCD_CS,
+        .dc_gpio_num = PIN_LCD_DC,
+        .spi_mode = 0,
+        .pclk_hz = 40 * 1000 * 1000,
+        .trans_queue_depth = 10,
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &io),
+                        TAG, "panel io");
+
+    esp_lcd_panel_dev_config_t panel_cfg = {
+        .reset_gpio_num = PIN_LCD_RST,
+        .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
+        .bits_per_pixel = 16,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel), TAG, "st7789");
+
+    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
+    return ESP_OK;
+}
+
+/* ---------------- SD ---------------- */
+static bool sd_mount(void)
+{
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = LCD_HOST;
+    sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot.gpio_cs = PIN_SD_CS;
+    slot.host_id = LCD_HOST;
+    esp_vfs_fat_sdmmc_mount_config_t mcfg = {
+        .format_if_mount_failed = true,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024,
+    };
+    sdmmc_card_t *card = NULL;
+    esp_err_t err = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mcfg, &card);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "SD mount failed: 0x%x (%s)", err, esp_err_to_name(err));
+        return false;
+    }
+    sdmmc_card_print_info(stdout, card);
+    return true;
+}
+
+/* ---------------- Audio (ES7210) ---------------- */
+static esp_err_t audio_init(void)
+{
+    /* I2S RX channel in TDM mode (es7210 driver defaults to Philips format) */
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 8;      /* more/larger DMA buffers (~0.5s slack) so SD/LCD */
+    chan_cfg.dma_frame_num = 1023;  /* stalls don't overflow the ring and click the audio */
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_i2s_rx), TAG, "i2s new");
+
+    i2s_tdm_config_t tdm_cfg = {
+        .slot_cfg = I2S_TDM_PHILIPS_SLOT_DEFAULT_CONFIG(SAMPLE_BITS, I2S_SLOT_MODE_STEREO,
+                                                        I2S_TDM_SLOT0 | I2S_TDM_SLOT1),
+        .clk_cfg = {
+            .clk_src = I2S_CLK_SRC_DEFAULT,
+            .sample_rate_hz = SAMPLE_RATE,
+            .mclk_multiple = I2S_MCLK_MULTIPLE_256,
+        },
+        .gpio_cfg = {
+            .mclk = PIN_I2S_MCLK,
+            .bclk = PIN_I2S_BCLK,
+            .ws   = PIN_I2S_WS,
+            .dout = -1,           /* ES7210 is ADC-only */
+            .din  = PIN_I2S_DIN,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_tdm_mode(s_i2s_rx, &tdm_cfg), TAG, "i2s tdm");
+
+    /* I2C master bus for ES7210 control */
+    i2c_master_bus_handle_t i2c_bus = NULL;
+    i2c_master_bus_config_t i2c_cfg = {
+        .i2c_port = I2C_PORT,
+        .sda_io_num = PIN_I2C_SDA,
+        .scl_io_num = PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &i2c_bus), TAG, "i2c bus");
+
+    audio_codec_i2c_cfg_t ctrl_cfg = {
+        .port = I2C_PORT,
+        .addr = ES7210_CODEC_DEFAULT_ADDR,
+        .bus_handle = i2c_bus,
+    };
+    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
+    ESP_RETURN_ON_FALSE(ctrl_if, ESP_FAIL, TAG, "es7210 i2c ctrl");
+
+    audio_codec_i2s_cfg_t i2s_data_cfg = {
+        .port = 0,
+        .rx_handle = s_i2s_rx,
+        .tx_handle = NULL,
+    };
+    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
+    ESP_RETURN_ON_FALSE(data_if, ESP_FAIL, TAG, "es7210 i2s data");
+
+    es7210_codec_cfg_t es_cfg = {
+        .ctrl_if = ctrl_if,
+        .master_mode = false,
+        .mic_selected = MIC_SELECTED,
+        .mclk_src = ES7210_MCLK_FROM_PAD,
+        .mclk_div = I2S_MCLK_MULTIPLE_256,
+    };
+    const audio_codec_if_t *es_if = es7210_codec_new(&es_cfg);
+    ESP_RETURN_ON_FALSE(es_if, ESP_FAIL, TAG, "es7210 new");
+
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_IN,
+        .codec_if = es_if,
+        .data_if = data_if,
+    };
+    s_codec = esp_codec_dev_new(&dev_cfg);
+    ESP_RETURN_ON_FALSE(s_codec, ESP_FAIL, TAG, "codec dev new");
+
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel = CHAN_NUM,
+        .channel_mask = MIC_SELECTED,
+        .sample_rate = SAMPLE_RATE,
+    };
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_codec, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "codec open");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_codec, MIC_GAIN_DB) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "set gain");
+
+    ESP_LOGI(TAG, "ES7210 ready: %d Hz, %d ch, 16-bit, gain %.0f dB",
+             SAMPLE_RATE, CHAN_NUM, MIC_GAIN_DB);
+    return ESP_OK;
+}
+
+/* pick the next unused /sdcard/rec_NNN.wav */
+static int next_index(void)
+{
+    for (int i = 1; i < 1000; i++) {
+        char path[64];
+        snprintf(path, sizeof(path), MOUNT_POINT "/rec_%03d.wav", i);
+        FILE *f = fopen(path, "r");
+        if (!f) return i;
+        fclose(f);
+    }
+    return 999;
+}
+
+/* Record RECORD_SECONDS of audio to a WAV on the SD card, updating the progress bar. */
+static void record_wav(int index)
+{
+    char path[64];
+    snprintf(path, sizeof(path), MOUNT_POINT "/rec_%03d.wav", index);
+
+    const uint32_t byte_rate = SAMPLE_RATE * CHAN_NUM * 16 / 8;
+    const uint32_t wav_size  = byte_rate * RECORD_SECONDS;
+    const wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(wav_size, 16, SAMPLE_RATE, CHAN_NUM);
+
+    FILE *f = fopen(path, "w");
+    if (!f) { ESP_LOGE(TAG, "open %s failed", path); return; }
+    fwrite(&hdr, sizeof(hdr), 1, f);
+
+    ESP_LOGI(TAG, "Recording %ds -> %s", RECORD_SECONDS, path);
+    lcd_recording_begin();
+
+    /* drain stale DMA data so the clip starts clean (no pre-roll / startup click) */
+    static uint8_t buf[4096];
+    size_t drained = 0;
+    while (i2s_channel_read(s_i2s_rx, buf, sizeof(buf), &drained, 0) == ESP_OK && drained > 0) { }
+
+    uint32_t written = 0;
+    int last_pct = -1;
+    while (written < wav_size) {
+        size_t to_read = sizeof(buf);
+        if (wav_size - written < to_read) to_read = wav_size - written;
+        size_t got = 0;
+        esp_err_t r = i2s_channel_read(s_i2s_rx, buf, to_read, &got, pdMS_TO_TICKS(1000));
+        if (r != ESP_OK) { ESP_LOGE(TAG, "i2s read: %s", esp_err_to_name(r)); break; }
+        fwrite(buf, got, 1, f);
+        written += got;
+
+        lcd_recording_update((float)written / wav_size);
+        int pct = (int)(100.0f * written / wav_size);
+        if (pct / 20 != last_pct / 20) { ESP_LOGI(TAG, "  %d%%", pct); }
+        last_pct = pct;
+    }
+    fclose(f);
+    ESP_LOGI(TAG, "Saved %s (%" PRIu32 " bytes)", path, written);
+
+    lcd_fill(C_WHITE);                 /* SAVED flash */
+    vTaskDelay(pdMS_TO_TICKS(250));
+}
+
+void app_main(void)
+{
+    spi_bus_config_t buscfg = {
+        .sclk_io_num = PIN_SCLK,
+        .mosi_io_num = PIN_MOSI,
+        .miso_io_num = PIN_MISO,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = LCD_H_RES * 80 * sizeof(uint16_t),
+    };
+    ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+    ESP_ERROR_CHECK(lcd_init());
+    lcd_fill(C_BLUE);
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    s_sd_ok = sd_mount();
+
+    esp_err_t aerr = audio_init();
+    if (aerr != ESP_OK) {
+        ESP_LOGE(TAG, "audio_init failed: %s -- check ES7210 / AXP rails", esp_err_to_name(aerr));
+    }
+    bool ready = s_sd_ok && (aerr == ESP_OK);
+
+    lcd_fill(ready ? C_GREEN : C_MAGENTA);
+    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d). Press BOOT to record %ds.",
+             ready, s_sd_ok, aerr == ESP_OK, RECORD_SECONDS);
+
+    gpio_config_t btn = {
+        .pin_bit_mask = 1ULL << PIN_BTN,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn));
+
+    int prev = 1, hb = 0;
+    while (1) {
+        if (++hb >= 50) {
+            hb = 0;
+            ESP_LOGI(TAG, "hb: sd=%d audio=%d btn=%d", s_sd_ok, aerr == ESP_OK,
+                     gpio_get_level(PIN_BTN));
+        }
+        int level = gpio_get_level(PIN_BTN);
+        if (prev == 1 && level == 0) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            if (gpio_get_level(PIN_BTN) == 0) {
+                if (ready) {
+                    record_wav(next_index());
+                } else {
+                    ESP_LOGW(TAG, "not ready, ignoring press");
+                }
+                lcd_fill(ready ? C_GREEN : C_MAGENTA);
+                while (gpio_get_level(PIN_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+            }
+        }
+        prev = level;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+}

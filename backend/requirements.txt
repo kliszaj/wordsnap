@@ -1,0 +1,5 @@
+anthropic
+openai
+pydantic
+python-dateutil
+python-dotenv

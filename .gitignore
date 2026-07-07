@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/.venv/
+
+__pycache__/
+*.py[cod]
+
+firmware/build/
+firmware/managed_components/

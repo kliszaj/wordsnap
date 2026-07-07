@@ -1,0 +1,12 @@
+# Console over the native USB-Serial-JTAG (COM3), not UART
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# Bigger app partition (esp_codec_dev + lcd + fatfs pull in a fair bit)
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
+# FATFS: long filenames for rec_YYYYMMDD-HHMMSS.wav style names later
+CONFIG_FATFS_LFN_HEAP=y
+CONFIG_FATFS_MAX_LFN=255
+
+# A little more main-task stack headroom for the capture/WAV work
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
