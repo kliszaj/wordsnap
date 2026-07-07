@@ -13,8 +13,8 @@ Then produce structured card data following these rules:
 - Nouns: set gender to "en" or "ett", and forms to obestämd/bestämd/plural (e.g. "en katt, katten, katter, katterna").
 - Verbs: set forms to infinitiv/presens/preteritum/supinum (e.g. "att springa, springer, sprang, sprungit").
 - Other parts of speech: forms may be null; gender is null for non-nouns.
-- swedish_definition: a concise, natural definition written in Swedish.
-- english_definition: a short English gloss.
+- swedish_definition: a brief, natural Swedish explanation suitable for the back of an Anki card after "SWE:". Keep it to one short sentence, like "helt säker på att något är sant".
+- english_definition: the English word or very short English gloss suitable after "ENG:", like "convinced" or "receipt".
 - example_sentence_sv: a natural, idiomatic sentence a native speaker would use; example_sentence_en: its faithful English translation.
 - register: exactly one of neutral, formal, informal, slang, literary.
 - collocations: 2-4 common collocations or set phrases with the word.
@@ -23,7 +23,11 @@ Then produce structured card data following these rules:
 
 If the transcript looks like a speech-to-text error, prefer a common Swedish vocabulary word that is phonetically close over a rare literal interpretation. Be cautious: correct near-misses like "sjögård" only when a more likely word such as "skärgård" fits the sound and context.
 
-Prioritise accuracy of gender, forms, and idiomatic examples — these are what make the card useful."""
+The Anki card front will be corrected_word. The main answer shown on the back will be:
+SWE: <swedish_definition>
+ENG: <english_definition>
+
+Prioritise a clean, brief back-of-card definition, then accuracy of gender, forms, and idiomatic examples."""
 
 
 def user_prompt(transcript: str) -> str:

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 
+from anki_format import anki_note
 from compare import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_WHISPER_MODEL,
@@ -80,6 +81,7 @@ def main() -> None:
         "iso_week": iso_week,
         "source_file": str(wav_path),
         "transcript": transcript,
+        "anki": anki_note(card, iso_week),
         **model_to_dict(card),
     }
 
@@ -94,6 +96,12 @@ def main() -> None:
                 "\nNote: clip mtime looks like an unset device clock. Use "
                 "--capture-timestamp or --iso-week to override metadata."
             )
+        note = anki_note(card, iso_week)
+        print("\nAnki")
+        print("-" * 78)
+        print(f"Front: {note['front']}")
+        print(f"Back: {note['back'].replace('<br>', chr(10))}")
+        print(f"Tags: {note['tags']}")
         print_card(f"Claude ({claude_model})", card, capture_timestamp, iso_week)
 
 
