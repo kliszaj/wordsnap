@@ -1,0 +1,88 @@
+# WordSnap Product UI
+
+## System Shape
+
+WordSnap has two interfaces with one visual language.
+
+- Device: capture and upload. It should be fast, low-text, and thumb-sized.
+- Hoth website: review and correction. It should expose every clip/card state before anything reaches Anki.
+
+The device is not the place to correct language. The website is.
+
+## Device Screens
+
+### Home
+
+- Charcoal rounded screen.
+- Top pill: `Upload [12]`, where the number is pending local clips.
+- Large red circular record button.
+- Tap record: start a new recording.
+- Tap upload: upload pending clips to the configured Hoth receiver.
+
+### Recording
+
+- Dotted charcoal background.
+- Huge elapsed timer, e.g. `00:12`.
+- Lower-left `REC` with red dot.
+- Lower-right clip index pill, e.g. `01`.
+- Tap recording screen: stop and save.
+- Hard cap still applies as a safety timeout.
+
+### Upload
+
+- Top/status view: `Uploading 03/12`.
+- Progress bar.
+- Success state: `Synced 12`.
+- Failure state: `Failed 02`, with clips retained on device.
+
+## Hoth Website
+
+### Inbox
+
+The main page shows one row per clip/card.
+
+Each row includes:
+
+- upload filename
+- status: `uploaded`, `processing`, `processed`, `needs_review`, `approved`, `exported`, `error`
+- audio playback
+- Whisper transcript
+- corrected word
+- Anki front/back preview
+- actions: process, reprocess, save edits, approve, export
+
+### Correction
+
+The correction loop is deliberately manual:
+
+1. Listen to audio.
+2. Fix transcript or target word.
+3. Reprocess with Claude.
+4. Edit final `SWE:` / `ENG:` if needed.
+5. Approve.
+
+The app does not auto-send to Anki until review is approved.
+
+## API Contract
+
+Device-facing:
+
+- `POST /api/upload`: multipart `file`, optional `capture_timestamp`, optional `device_id`.
+- Response includes `id`, `status`, and server time.
+- `GET /api/device/status`: upload count and server time.
+
+Website-facing:
+
+- `GET /api/clips`
+- `POST /api/clips/{id}/process`
+- `PATCH /api/clips/{id}`
+- `POST /api/clips/{id}/approve`
+- `GET /api/export/anki.csv`
+
+## Visual Language
+
+- Background: off-black/charcoal, never pure black.
+- Accent: recording red.
+- Secondary accent: muted blue-lavender text.
+- Controls: rounded pills and large touch targets.
+- Web UI should feel like the device grew up into a review dashboard, not like an unrelated admin panel.

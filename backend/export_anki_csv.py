@@ -1,8 +1,4 @@
-"""Export Wordclip JSON/JSONL card records to an Anki-importable CSV.
-
-Expected input records are the JSON objects printed by process_clip.py --json,
-one object per line for JSONL, or a list of objects for JSON.
-"""
+"""Export WordSnap cards to an Anki-importable CSV."""
 from __future__ import annotations
 
 import argparse
@@ -10,6 +6,8 @@ import csv
 import json
 from pathlib import Path
 from typing import Any
+
+from store import load_clips
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -27,18 +25,27 @@ def load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export Wordclip records to Anki CSV.")
-    parser.add_argument("input", type=Path, help="JSON or JSONL records from process_clip.py")
-    parser.add_argument("output", type=Path, help="Destination CSV path")
+    parser = argparse.ArgumentParser(
+        description="Export WordSnap records to Anki CSV. Pass output.csv to export approved store cards, or input.json output.csv."
+    )
+    parser.add_argument("paths", type=Path, nargs="+")
     return parser.parse_args()
+
+
+def records_from_args(paths: list[Path]) -> tuple[list[dict[str, Any]], Path]:
+    if len(paths) == 1:
+        return [clip for clip in load_clips() if clip.get("status") == "approved" and clip.get("anki")], paths[0]
+    if len(paths) == 2:
+        return load_records(paths[0]), paths[1]
+    raise SystemExit("Usage: export_anki_csv.py [input.json|input.jsonl] output.csv")
 
 
 def main() -> None:
     args = parse_args()
-    records = load_records(args.input)
-    args.output.parent.mkdir(parents=True, exist_ok=True)
+    records, output_path = records_from_args(args.paths)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with args.output.open("w", newline="", encoding="utf-8-sig") as f:
+    with output_path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=["Front", "Back", "Tags"])
         writer.writeheader()
         for record in records:
@@ -51,7 +58,7 @@ def main() -> None:
                 }
             )
 
-    print(f"Wrote {len(records)} cards to {args.output}")
+    print(f"Wrote {len(records)} cards to {output_path}")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WordSnap Hoth</title>
+    <link rel="stylesheet" href="/assets/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Hoth receiver</p>
+          <h1>Word review before Anki.</h1>
+          <p class="lede">
+            Uploaded clips land here first. Listen, fix the transcript, reprocess with Claude,
+            then approve the compact SWE/ENG card for Anki import.
+          </p>
+        </div>
+        <div class="device-preview" aria-label="Device UI preview">
+          <div class="upload-pill">Upload <span id="pending-count">[00]</span></div>
+          <button class="record-orb" type="button" aria-label="Record preview"></button>
+        </div>
+      </section>
+
+      <section class="toolbar" aria-label="Dashboard actions">
+        <div class="metric">
+          <span id="metric-total">00</span>
+          <label>clips</label>
+        </div>
+        <div class="metric">
+          <span id="metric-review">00</span>
+          <label>review</label>
+        </div>
+        <div class="metric">
+          <span id="metric-approved">00</span>
+          <label>approved</label>
+        </div>
+        <div class="toolbar-actions">
+          <label class="file-button">
+            Upload WAV
+            <input id="file-input" type="file" accept="audio/wav,.wav" multiple />
+          </label>
+          <a class="ghost-button" href="/api/export/anki.csv">Export CSV</a>
+        </div>
+      </section>
+
+      <section class="review-board">
+        <div class="board-head">
+          <div>
+            <p class="eyebrow">Inbox</p>
+            <h2>Clips and cards</h2>
+          </div>
+          <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
+        </div>
+        <div id="clip-list" class="clip-list" aria-live="polite"></div>
+      </section>
+    </main>
+
+    <template id="clip-template">
+      <article class="clip">
+        <div class="clip-top">
+          <div>
+            <div class="clip-title"></div>
+            <div class="clip-meta"></div>
+          </div>
+          <span class="status"></span>
+        </div>
+        <audio class="audio" controls preload="none"></audio>
+        <div class="fields">
+          <label>
+            Transcript
+            <textarea class="transcript" rows="2"></textarea>
+          </label>
+          <label>
+            Corrected word
+            <input class="corrected-word" />
+          </label>
+          <label>
+            SWE
+            <textarea class="swedish-definition" rows="2"></textarea>
+          </label>
+          <label>
+            ENG
+            <input class="english-definition" />
+          </label>
+        </div>
+        <div class="anki-preview">
+          <div class="front"></div>
+          <div class="back"></div>
+        </div>
+        <div class="clip-actions">
+          <button class="process" type="button">Process</button>
+          <button class="save" type="button">Save edits</button>
+          <button class="approve" type="button">Approve</button>
+        </div>
+        <p class="error"></p>
+      </article>
+    </template>
+
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

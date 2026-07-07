@@ -6,6 +6,9 @@ backend/.env
 backend/.env.*
 !backend/.env.example
 backend/.venv/
+backend/data/
+backend/*.log
+backend/*.err.log
 
 __pycache__/
 *.py[cod]

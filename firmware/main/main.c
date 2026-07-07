@@ -2,9 +2,11 @@
  * Wordclip capture-test firmware  --  Stage B
  * Board: Waveshare ESP32-C6-Touch-LCD-1.83
  *
- *   - LCD status display (green ready / red+bar recording / white saved / magenta SD-fail)
+ *   - LCD status display styled after the WordSnap UI mockups
+ *   - Home view: upload pill + large red record button
+ *   - Recording view: dark dotted field + stop-capable capture
  *   - microSD (FAT32) over shared SPI2 bus
- *   - BOOT button (GPIO9) -> record ~10s from the ES7210 dual-mic array -> WAV on SD
+ *   - BOOT button (GPIO9) currently mirrors touchscreen record/stop until touch driver is wired
  *
  * Audio: ES7210 4-ch ADC (we use MIC1+MIC2), I2S TDM 2-slot, 16 kHz / 16-bit stereo.
  * Pins (schematic Rev1.2 + Waveshare examples):
@@ -30,6 +32,7 @@
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
 #include "esp_check.h"
+#include "esp_timer.h"
 #include "format_wav.h"
 
 static const char *TAG = "wordclip";
@@ -64,22 +67,30 @@ static const char *TAG = "wordclip";
 #define CHAN_NUM        2                     /* MIC1 + MIC2 */
 #define MIC_SELECTED    (ES7210_SEL_MIC1 | ES7210_SEL_MIC2)
 #define MIC_GAIN_DB     37.5f          /* ES7210 analog PGA near max; raise level for quiet capture */
-#define RECORD_SECONDS  10
+#define MAX_RECORD_SECONDS 15
+#define MIN_RECORD_MS      600
 
 /* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
 #define C_WHITE   0xFFFF
 #define C_RED     0xF800
 #define C_GREEN   0x07E0
-#define C_BLUE    0x001F
 #define C_MAGENTA 0xF81F
-#define C_GREY    0x8410
+#define C_CHARCOAL 0x2124
+#define C_PANEL    0x18E3
+#define C_MUTED    0xA534
+#define C_DOT      0x39E7
+#define C_DARK_RED 0xA145
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static bool s_sd_ok = false;
 static i2s_chan_handle_t s_i2s_rx = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
+static int s_active_clip_index = 0;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
+
+static int next_index(void);
+static int pending_clip_count(void);
 
 /* ---------------- LCD ---------------- */
 static void lcd_fill(uint16_t color)
@@ -92,47 +103,97 @@ static void lcd_fill(uint16_t color)
     }
 }
 
-/* Progress-bar geometry */
-#define BAR_MARGIN 20
-#define BAR_W      (LCD_H_RES - 2 * BAR_MARGIN)
-#define BAR_Y      (LCD_V_RES / 2 - 18)
-#define BAR_H      36
+static void lcd_rect(int x0, int y0, int x1, int y1, uint16_t color)
+{
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > LCD_H_RES) x1 = LCD_H_RES;
+    if (y1 > LCD_V_RES) y1 = LCD_V_RES;
+    if (x1 <= x0 || y1 <= y0) return;
 
-static int s_bar_filled;   /* px of the bar currently painted white */
+    static uint16_t row[LCD_H_RES];
+    uint16_t v = sw16(color);
+    int w = x1 - x0;
+    for (int x = 0; x < w; x++) row[x] = v;
+    for (int y = y0; y < y1; y++) {
+        esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, row);
+    }
+}
 
-/* Paint the full red screen + empty (grey) bar ONCE, before recording starts.
- * Kept off the audio read loop so it never starves the I2S DMA. */
-static void lcd_recording_begin(void)
+static void lcd_disc(int cx, int cy, int r, uint16_t color)
 {
     static uint16_t row[LCD_H_RES];
-    uint16_t bg = sw16(C_RED), rest = sw16(C_GREY);
+    uint16_t v = sw16(color);
+    for (int y = cy - r; y <= cy + r; y++) {
+        if (y < 0 || y >= LCD_V_RES) continue;
+        int dy = y - cy;
+        int dx = 0;
+        while (dx * dx + dy * dy <= r * r) dx++;
+        int x0 = cx - dx + 1;
+        int x1 = cx + dx;
+        if (x0 < 0) x0 = 0;
+        if (x1 > LCD_H_RES) x1 = LCD_H_RES;
+        int w = x1 - x0;
+        for (int x = 0; x < w; x++) row[x] = v;
+        if (w > 0) esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, row);
+    }
+}
+
+static void ui_show_home(void)
+{
+    lcd_fill(C_CHARCOAL);
+    /* Upload pill. Text rendering moves to LVGL; this shape reserves the touch target. */
+    lcd_rect(52, 32, 188, 78, C_PANEL);
+    lcd_disc(52, 55, 23, C_PANEL);
+    lcd_disc(188, 55, 23, C_PANEL);
+
+    /* Large record target from the mockup. */
+    lcd_disc(120, 178, 63, C_DARK_RED);
+    lcd_disc(120, 178, 58, C_RED);
+
+    ESP_LOGI(TAG, "UI home: pending=%d", pending_clip_count());
+}
+
+static void ui_show_recording(uint32_t elapsed_ms)
+{
+    static uint16_t row[LCD_H_RES];
+    uint16_t bg = sw16(C_CHARCOAL), dot = sw16(C_DOT), muted = sw16(C_MUTED);
     for (int y = 0; y < LCD_V_RES; y++) {
-        bool in_bar = (y >= BAR_Y && y < BAR_Y + BAR_H);
         for (int x = 0; x < LCD_H_RES; x++) {
-            row[x] = (in_bar && x >= BAR_MARGIN && x < BAR_MARGIN + BAR_W) ? rest : bg;
+            bool is_dot = ((x % 16) == 0) && ((y % 16) == 0);
+            row[x] = is_dot ? dot : bg;
         }
         esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, row);
     }
-    s_bar_filled = 0;
+
+    /* REC dot and clip-index pill; timer text comes with the LVGL pass. */
+    lcd_disc(38, 236, 7, C_RED);
+    lcd_rect(182, 226, 226, 258, muted);
+    lcd_disc(182, 242, 16, muted);
+    lcd_disc(226, 242, 16, muted);
+
+    int pct = (int)((elapsed_ms * 100) / (MAX_RECORD_SECONDS * 1000));
+    ESP_LOGI(TAG, "UI recording: clip=%03d elapsed=%" PRIu32 "ms pct=%d", s_active_clip_index, elapsed_ms, pct);
 }
 
-/* Draw only the newly-filled slice of the bar (small transfer, cheap on the SPI bus). */
-static void lcd_recording_update(float frac)
+static void ui_show_saved(void)
 {
-    int fill_w = (int)(BAR_W * frac);
-    if (fill_w > BAR_W) fill_w = BAR_W;
-    if (fill_w <= s_bar_filled) return;
+    lcd_fill(C_WHITE);
+    vTaskDelay(pdMS_TO_TICKS(180));
+    ui_show_home();
+}
 
-    int slice_w = fill_w - s_bar_filled;
-    static uint16_t row[BAR_W];
-    uint16_t white = sw16(C_WHITE);
-    for (int x = 0; x < slice_w; x++) row[x] = white;
+static bool touch_record_pressed(void)
+{
+    /* TODO: wire capacitive touch controller and hit-test the record orb.
+     * BOOT mirrors this action for now so the state machine can be tested. */
+    return false;
+}
 
-    int x0 = BAR_MARGIN + s_bar_filled;
-    for (int y = BAR_Y; y < BAR_Y + BAR_H; y++) {
-        esp_lcd_panel_draw_bitmap(s_panel, x0, y, x0 + slice_w, y + 1, row);
-    }
-    s_bar_filled = fill_w;
+static bool touch_upload_pressed(void)
+{
+    /* TODO: hit-test the upload pill after the touch controller is wired. */
+    return false;
 }
 
 static esp_err_t lcd_init(void)
@@ -293,22 +354,30 @@ static int next_index(void)
     return 999;
 }
 
-/* Record RECORD_SECONDS of audio to a WAV on the SD card, updating the progress bar. */
+static int pending_clip_count(void)
+{
+    int next = next_index();
+    if (next <= 1) return 0;
+    return next - 1;
+}
+
+/* Record audio to a WAV until stop is requested or the safety cap is reached. */
 static void record_wav(int index)
 {
     char path[64];
     snprintf(path, sizeof(path), MOUNT_POINT "/rec_%03d.wav", index);
 
     const uint32_t byte_rate = SAMPLE_RATE * CHAN_NUM * 16 / 8;
-    const uint32_t wav_size  = byte_rate * RECORD_SECONDS;
-    const wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(wav_size, 16, SAMPLE_RATE, CHAN_NUM);
+    const uint32_t max_wav_size  = byte_rate * MAX_RECORD_SECONDS;
+    wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(max_wav_size, 16, SAMPLE_RATE, CHAN_NUM);
 
     FILE *f = fopen(path, "w");
     if (!f) { ESP_LOGE(TAG, "open %s failed", path); return; }
     fwrite(&hdr, sizeof(hdr), 1, f);
 
-    ESP_LOGI(TAG, "Recording %ds -> %s", RECORD_SECONDS, path);
-    lcd_recording_begin();
+    ESP_LOGI(TAG, "Recording max %ds -> %s", MAX_RECORD_SECONDS, path);
+    s_active_clip_index = index;
+    ui_show_recording(0);
 
     /* drain stale DMA data so the clip starts clean (no pre-roll / startup click) */
     static uint8_t buf[4096];
@@ -317,25 +386,42 @@ static void record_wav(int index)
 
     uint32_t written = 0;
     int last_pct = -1;
-    while (written < wav_size) {
+    int64_t start_tick = esp_timer_get_time() / 1000;
+    bool stop_armed = false;
+    while (written < max_wav_size) {
         size_t to_read = sizeof(buf);
-        if (wav_size - written < to_read) to_read = wav_size - written;
+        if (max_wav_size - written < to_read) to_read = max_wav_size - written;
         size_t got = 0;
         esp_err_t r = i2s_channel_read(s_i2s_rx, buf, to_read, &got, pdMS_TO_TICKS(1000));
         if (r != ESP_OK) { ESP_LOGE(TAG, "i2s read: %s", esp_err_to_name(r)); break; }
         fwrite(buf, got, 1, f);
         written += got;
 
-        lcd_recording_update((float)written / wav_size);
-        int pct = (int)(100.0f * written / wav_size);
+        uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() / 1000) - start_tick);
+        int pct = (int)(100.0f * written / max_wav_size);
         if (pct / 20 != last_pct / 20) { ESP_LOGI(TAG, "  %d%%", pct); }
         last_pct = pct;
+
+        if (gpio_get_level(PIN_BTN) == 1) stop_armed = true;
+        bool stop_pressed = stop_armed && gpio_get_level(PIN_BTN) == 0;
+        if (elapsed_ms > MIN_RECORD_MS && (stop_pressed || touch_record_pressed())) {
+            ESP_LOGI(TAG, "Stop requested at %" PRIu32 "ms", elapsed_ms);
+            break;
+        }
     }
+    hdr = (wav_header_t)WAV_HEADER_PCM_DEFAULT(written, 16, SAMPLE_RATE, CHAN_NUM);
+    fseek(f, 0, SEEK_SET);
+    fwrite(&hdr, sizeof(hdr), 1, f);
     fclose(f);
     ESP_LOGI(TAG, "Saved %s (%" PRIu32 " bytes)", path, written);
+    ui_show_saved();
+}
 
-    lcd_fill(C_WHITE);                 /* SAVED flash */
-    vTaskDelay(pdMS_TO_TICKS(250));
+static void upload_pending_clips(void)
+{
+    /* TODO: enable WiFi, POST each /sdcard/rec_NNN.wav to /api/upload, delete on ACK.
+     * This is intentionally separate from capture mode; WiFi and I2S should not overlap. */
+    ESP_LOGW(TAG, "Upload requested but WiFi upload transport is not wired yet");
 }
 
 void app_main(void)
@@ -351,7 +437,7 @@ void app_main(void)
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     ESP_ERROR_CHECK(lcd_init());
-    lcd_fill(C_BLUE);
+    lcd_fill(C_CHARCOAL);
     vTaskDelay(pdMS_TO_TICKS(300));
 
     s_sd_ok = sd_mount();
@@ -362,9 +448,10 @@ void app_main(void)
     }
     bool ready = s_sd_ok && (aerr == ESP_OK);
 
-    lcd_fill(ready ? C_GREEN : C_MAGENTA);
-    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d). Press BOOT to record %ds.",
-             ready, s_sd_ok, aerr == ESP_OK, RECORD_SECONDS);
+    if (ready) ui_show_home();
+    else lcd_fill(C_MAGENTA);
+    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d). Press BOOT to record; press again to stop.",
+             ready, s_sd_ok, aerr == ESP_OK);
 
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BTN,
@@ -381,6 +468,10 @@ void app_main(void)
                      gpio_get_level(PIN_BTN));
         }
         int level = gpio_get_level(PIN_BTN);
+        if (touch_upload_pressed()) {
+            upload_pending_clips();
+            ui_show_home();
+        }
         if (prev == 1 && level == 0) {
             vTaskDelay(pdMS_TO_TICKS(30));
             if (gpio_get_level(PIN_BTN) == 0) {
@@ -389,7 +480,8 @@ void app_main(void)
                 } else {
                     ESP_LOGW(TAG, "not ready, ignoring press");
                 }
-                lcd_fill(ready ? C_GREEN : C_MAGENTA);
+                if (ready) ui_show_home();
+                else lcd_fill(C_MAGENTA);
                 while (gpio_get_level(PIN_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
             }
         }

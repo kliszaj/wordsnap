@@ -1,5 +1,8 @@
 anthropic
+fastapi
 openai
 pydantic
 python-dateutil
 python-dotenv
+python-multipart
+uvicorn
