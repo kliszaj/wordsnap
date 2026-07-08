@@ -4,10 +4,10 @@ Context for picking up this project. Goal (per [prd-wordclip.md](prd-wordclip.md
 ESP32-C6 device captures spoken Swedish words, uploads clips to a self-hosted Hoth/Unraid pipeline,
 transcribes with Whisper, enriches with Claude, and produces reviewable Anki cards sorted by ISO week.
 
-Latest pushed commit at handoff time before this touch pass:
+Latest pushed commit at handoff time:
 
 ```text
-4138f1f Prototype cassette UI directions
+6f6e56e Apply selected ledger signal UI
 ```
 
 Repo: <https://github.com/kliszaj/wordsnap>
@@ -25,6 +25,7 @@ Repo: <https://github.com/kliszaj/wordsnap>
 | Backend Claude pipeline | Working; Claude selected as enrichment provider |
 | Hoth receiver API | Implemented with FastAPI and local JSON/file store |
 | Web review UI | Implemented dark dashboard for upload, playback, edit, reprocess, approve, export |
+| Docker / Hoth deploy | Docker Hub image + compose deploy path added and build-verified |
 | Anki export | CSV export implemented for approved cards |
 | Direct AnkiConnect | Not implemented yet |
 
@@ -166,7 +167,9 @@ Server/review UI files:
 - [backend/process_folder.py](backend/process_folder.py): import/process a folder of WAV clips.
 - [backend/export_anki_csv.py](backend/export_anki_csv.py): export approved cards.
 - [backend/Dockerfile](backend/Dockerfile)
-- [docker-compose.unraid.yml](docker-compose.unraid.yml)
+- [backend/.dockerignore](backend/.dockerignore): keeps `.env`, runtime data, logs, caches, and venv out of images.
+- [docker-compose.build.yml](docker-compose.build.yml): local image build/tag for Docker Hub.
+- [docker-compose.unraid.yml](docker-compose.unraid.yml): Hoth/Unraid deploy file that pulls `kliszaj/wordsnap:latest`.
 
 Env:
 
@@ -185,6 +188,21 @@ GPT_MODEL=gpt-5.5
 ```
 
 Do not print secrets.
+
+Docker build/push/deploy:
+
+```powershell
+docker compose -f docker-compose.build.yml build
+docker push kliszaj/wordsnap:latest
+docker compose -f docker-compose.unraid.yml pull
+docker compose -f docker-compose.unraid.yml up -d
+```
+
+Notes:
+
+- `docker-compose.unraid.yml` exposes `8080`, reads `backend/.env`, persists `/app/data`, and healthchecks `/api/health`.
+- Set `WORDSNAP_DATA_DIR=/mnt/user/appdata/wordsnap/data` on Hoth to persist data in Unraid appdata.
+- Set `WORDSNAP_IMAGE=kliszaj/wordsnap:<tag>` to deploy a non-latest tag.
 
 Run local server:
 
@@ -287,8 +305,9 @@ Start here:
    - Add direct AnkiConnect later.
 
 5. **Deploy on Unraid**
-   - Use [docker-compose.unraid.yml](docker-compose.unraid.yml) as starting point.
-   - Persist `backend/data`.
+   - Build and push `kliszaj/wordsnap:latest` from [docker-compose.build.yml](docker-compose.build.yml).
+   - Use [docker-compose.unraid.yml](docker-compose.unraid.yml) on Hoth to pull the Docker Hub image.
+   - Persist `/app/data` via `WORDSNAP_DATA_DIR`, likely `/mnt/user/appdata/wordsnap/data`.
    - Keep `backend/.env` private.
 
 6. **Hardware caution**

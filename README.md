@@ -68,14 +68,43 @@ Export approved cards:
 backend\.venv\Scripts\python.exe backend\export_anki_csv.py backend\data\exports\anki-approved.csv
 ```
 
-## Unraid
+## Docker Image
 
-Use `docker-compose.unraid.yml` as the starting point. Persist `backend/data` to an Unraid appdata share, and keep `backend/.env` private.
+Build and tag the Docker Hub image from this repo:
 
 ```powershell
-docker compose -f docker-compose.unraid.yml up -d --build
+docker compose -f docker-compose.build.yml build
 ```
+
+Push it when you are ready to upload to Docker Hub:
+
+```powershell
+docker push kliszaj/wordsnap:latest
+```
+
+You can override the image name/tag for testing:
+
+```powershell
+$env:WORDSNAP_IMAGE="kliszaj/wordsnap:dev"
+docker compose -f docker-compose.build.yml build
+docker push $env:WORDSNAP_IMAGE
+```
+
+## Hoth / Unraid
+
+`docker-compose.unraid.yml` is the Hoth-ready deploy file. It pulls the Docker Hub image instead of building on the server.
+
+Create `backend/.env` on Hoth with the same values as local setup, then point `WORDSNAP_DATA_DIR` at your appdata share if you do not want to use `./backend/data`.
+
+```powershell
+$env:WORDSNAP_IMAGE="kliszaj/wordsnap:latest"
+$env:WORDSNAP_DATA_DIR="/mnt/user/appdata/wordsnap/data"
+docker compose -f docker-compose.unraid.yml pull
+docker compose -f docker-compose.unraid.yml up -d
+```
+
+The container serves the review UI on `http://<hoth-ip>:8080` and exposes `/api/health` for compose healthchecks.
 
 ## Device UI
 
-See `firmware/DEVICE_UI.md`. The current firmware has the home/recording UI state machine and BOOT-button start/stop proxy. The next firmware pass is wiring the capacitive touch controller and WiFi upload transport to `POST /api/upload`.
+See `firmware/DEVICE_UI.md`. The current firmware has the home/recording UI state machine, touch start/stop, and BOOT-button fallback. The next firmware pass is WiFi upload transport to `POST /api/upload`.

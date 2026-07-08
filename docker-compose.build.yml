@@ -1,14 +1,16 @@
 services:
   wordsnap:
+    build:
+      context: ./backend
     image: ${WORDSNAP_IMAGE:-kliszaj/wordsnap:latest}
-    container_name: wordsnap
+    container_name: wordsnap-build
     restart: unless-stopped
     ports:
       - "8080:8080"
     env_file:
       - ./backend/.env
     volumes:
-      - ${WORDSNAP_DATA_DIR:-./backend/data}:/app/data
+      - ./backend/data:/app/data
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health').read()"]
       interval: 30s

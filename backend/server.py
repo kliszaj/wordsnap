@@ -56,6 +56,11 @@ def index() -> str:
     return (WEB_DIR / "index.html").read_text(encoding="utf-8")
 
 
+@app.get("/api/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
 @app.get("/api/device/status")
 def device_status() -> dict[str, Any]:
     clips = load_clips()
