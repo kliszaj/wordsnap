@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>WordSnap Hoth</title>
-    <link rel="stylesheet" href="/assets/styles.css" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260708-2" />
   </head>
   <body>
     <main class="shell">
@@ -94,6 +94,18 @@
           <label class="settings-field">
             <span class="settings-label">GPT model (lab compare)</span>
             <input type="text" id="input-gpt-model" autocomplete="off" spellcheck="false" />
+          </label>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>Anki destination</legend>
+          <label class="settings-field">
+            <span class="settings-label">AnkiConnect URL</span>
+            <input type="url" id="input-anki-connect-url" autocomplete="off" spellcheck="false" placeholder="http://10.0.0.x:8765" />
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">Deck name</span>
+            <input type="text" id="input-anki-deck" autocomplete="off" spellcheck="false" placeholder="Default" />
           </label>
         </fieldset>
 
@@ -193,6 +205,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js"></script>
+    <script src="/assets/app.js?v=20260708-2"></script>
   </body>
 </html>

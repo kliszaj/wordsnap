@@ -17,6 +17,8 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 WHISPER_MODEL=whisper-1
 CLAUDE_MODEL=claude-sonnet-5
+ANKI_CONNECT_URL=
+ANKI_DECK=Default
 ```
 
 Install and run:
@@ -67,6 +69,9 @@ Export approved cards:
 ```powershell
 backend\.venv\Scripts\python.exe backend\export_anki_csv.py backend\data\exports\anki-approved.csv
 ```
+
+If `ANKI_CONNECT_URL` is configured, `Save to Anki` sends directly to that AnkiConnect endpoint and deck.
+If it is blank, `Save to Anki` marks the card approved for CSV export.
 
 ## Docker Image
 

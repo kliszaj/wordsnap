@@ -18,6 +18,8 @@
 #include <inttypes.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <time.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -474,9 +476,14 @@ static int next_index(void)
 
 static int pending_clip_count(void)
 {
-    int next = next_index();
-    if (next <= 1) return 0;
-    return next - 1;
+    int total = 0;
+    for (int i = 1; i < 1000; i++) {
+        char path[80];
+        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
+        FILE *p = fopen(path, "r");
+        if (p) { fclose(p); total++; }
+    }
+    return total;
 }
 
 /* Ensure /sdcard/clips exists, and move any legacy rec_*.wav out of the card root into it. */
@@ -685,22 +692,102 @@ static void wifi_down(void)
 }
 
 #define UP_BOUNDARY "----wordclipBoundary7MA4YWxkTrZu0gW"
+#define MIN_UPLOAD_WAV_BYTES 45
+
+static bool wav_file_has_audio(const char *path, long *size_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (size_out) *size_out = fsize;
+
+    uint8_t header[44] = {0};
+    size_t got = fread(header, 1, sizeof(header), f);
+    fclose(f);
+
+    if (fsize < MIN_UPLOAD_WAV_BYTES || got < sizeof(header)) return false;
+    if (memcmp(header, "RIFF", 4) != 0 || memcmp(header + 8, "WAVE", 4) != 0) return false;
+
+    uint32_t data_size = (uint32_t)header[40] |
+                         ((uint32_t)header[41] << 8) |
+                         ((uint32_t)header[42] << 16) |
+                         ((uint32_t)header[43] << 24);
+    return data_size > 0;
+}
+
+static bool file_capture_timestamp(const char *path, char *out, size_t out_len)
+{
+    struct stat st = {0};
+    if (stat(path, &st) != 0) return false;
+    if (st.st_mtime < 1704067200) return false;  /* before 2024-01-01 means RTC was not set */
+
+    struct tm tm_utc = {0};
+    gmtime_r(&st.st_mtime, &tm_utc);
+    strftime(out, out_len, "%Y-%m-%dT%H:%M:%SZ", &tm_utc);
+    return true;
+}
+
+static void sync_time_from_response(const char *body)
+{
+    const char *key = strstr(body, "\"server_time\":\"");
+    if (!key) return;
+    key += strlen("\"server_time\":\"");
+
+    int year, mon, day, hour, min, sec;
+    if (sscanf(key, "%d-%d-%dT%d:%d:%d", &year, &mon, &day, &hour, &min, &sec) != 6) return;
+    if (year < 2024) return;
+
+    struct tm tm_utc = {
+        .tm_year = year - 1900,
+        .tm_mon = mon - 1,
+        .tm_mday = day,
+        .tm_hour = hour,
+        .tm_min = min,
+        .tm_sec = sec,
+        .tm_isdst = 0,
+    };
+    time_t epoch = mktime(&tm_utc);
+    if (epoch <= 0) return;
+
+    struct timeval tv = {.tv_sec = epoch, .tv_usec = 0};
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "RTC synced from Hoth: %04d-%02d-%02dT%02d:%02d:%02d", year, mon, day, hour, min, sec);
+}
 
 /* POST one WAV to <server>/api/upload as multipart/form-data (field "file").
  * Returns the HTTP status code, or -1 on a transport error. */
 static int http_upload_file(const char *server, const char *fullpath, const char *filename)
 {
+    long checked_size = 0;
+    if (!wav_file_has_audio(fullpath, &checked_size)) {
+        ESP_LOGW(TAG, "skipping invalid/empty WAV %s (%ld bytes)", filename, checked_size);
+        return 0;  /* Local junk cleanup; no server request was made. */
+    }
+
     FILE *f = fopen(fullpath, "rb");
     if (!f) { ESP_LOGE(TAG, "open %s failed", fullpath); return -1; }
     fseek(f, 0, SEEK_END);
     long fsize = ftell(f);
     fseek(f, 0, SEEK_SET);
 
-    char preamble[224];
+    char capture_part[192] = "";
+    char captured_at[32] = "";
+    if (file_capture_timestamp(fullpath, captured_at, sizeof(captured_at))) {
+        snprintf(capture_part, sizeof(capture_part),
+            "--" UP_BOUNDARY "\r\n"
+            "Content-Disposition: form-data; name=\"capture_timestamp\"\r\n\r\n"
+            "%s\r\n", captured_at);
+    }
+
+    char preamble[384];
     int plen = snprintf(preamble, sizeof(preamble),
+        "%s"
         "--" UP_BOUNDARY "\r\n"
         "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
-        "Content-Type: audio/wav\r\n\r\n", filename);
+        "Content-Type: audio/wav\r\n\r\n", capture_part, filename);
     static const char epilogue[] = "\r\n--" UP_BOUNDARY "--\r\n";
     int elen = (int)(sizeof(epilogue) - 1);
     int content_length = plen + (int)fsize + elen;
@@ -733,6 +820,12 @@ static int http_upload_file(const char *server, const char *fullpath, const char
 
     esp_http_client_fetch_headers(client);
     status = esp_http_client_get_status_code(client);
+    char response_body[256] = {0};
+    int body_len = esp_http_client_read_response(client, response_body, sizeof(response_body) - 1);
+    if (body_len > 0) {
+        response_body[body_len] = '\0';
+        sync_time_from_response(response_body);
+    }
     ESP_LOGI(TAG, "upload %s (%ld bytes) -> HTTP %d", filename, fsize, status);
 
 done:
@@ -782,7 +875,7 @@ static void upload_pending_clips(void)
     upload_progress(0, total);
 
     /* Stage 3: upload every clip; delete each from the card only on a 2xx ACK. */
-    int uploaded = 0, failed = 0, processed = 0;
+    int uploaded = 0, skipped = 0, failed = 0, processed = 0;
     for (int i = 1; i < 1000 && processed < total; i++) {
         char path[80], name[24];
         snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
@@ -792,7 +885,10 @@ static void upload_pending_clips(void)
         fclose(probe);
 
         int status = http_upload_file(conf.server, path, name);
-        if (status >= 200 && status < 300) {
+        if (status == 0) {
+            remove(path);
+            skipped++;
+        } else if (status >= 200 && status < 300) {
             remove(path);
             uploaded++;
         } else {
@@ -806,7 +902,7 @@ static void upload_pending_clips(void)
     wifi_down();
     lcd_fill(failed == 0 ? C_GREEN : C_RED);   /* green only on a fully clean sync */
     vTaskDelay(pdMS_TO_TICKS(1200));
-    ESP_LOGI(TAG, "Sync finished: %d ok, %d failed", uploaded, failed);
+    ESP_LOGI(TAG, "Sync finished: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
 }
 
 void app_main(void)

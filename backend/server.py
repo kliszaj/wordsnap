@@ -2,13 +2,16 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import shutil
 import tempfile
 from pathlib import Path
 from typing import Any
+from urllib import request as urlrequest
+from urllib.error import URLError
 
-from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -31,6 +34,7 @@ import settings
 app = FastAPI(title="WordSnap Hoth")
 WEB_DIR = Path(__file__).with_name("web")
 EXPORT_DIR = DATA_DIR / "exports"
+MIN_WAV_BYTES = 45
 
 # Bootstrap credentials/config: host .env first (fallback), then appdata settings.json (wins).
 load_environment()
@@ -61,6 +65,79 @@ class SettingsPatch(BaseModel):
     whisper_model: str | None = None
     claude_model: str | None = None
     gpt_model: str | None = None
+    anki_connect_url: str | None = None
+    anki_deck: str | None = None
+
+
+def validate_wav_upload(path: Path) -> None:
+    size = path.stat().st_size
+    if size < MIN_WAV_BYTES:
+        raise HTTPException(status_code=400, detail="WAV upload is empty or too short")
+
+    with path.open("rb") as f:
+        header = f.read(44)
+    if len(header) < 44 or header[0:4] != b"RIFF" or header[8:12] != b"WAVE":
+        raise HTTPException(status_code=400, detail="Upload is not a valid WAV file")
+
+    data_size = int.from_bytes(header[40:44], "little")
+    if data_size <= 0:
+        raise HTTPException(status_code=400, detail="WAV contains no audio samples")
+
+
+def auto_process_clip(clip_id: str, capture_timestamp: str | None = None) -> None:
+    try:
+        process_clip(clip_id, ProcessRequest(capture_timestamp=capture_timestamp))
+    except HTTPException as exc:
+        update_clip(clip_id, {"status": "error", "error": str(exc.detail)})
+    except Exception as exc:
+        update_clip(clip_id, {"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _anki_tags(note: dict[str, Any]) -> list[str]:
+    tags = note.get("tags", "")
+    if isinstance(tags, list):
+        return [str(tag) for tag in tags if str(tag).strip()]
+    return [tag for tag in str(tags).split() if tag]
+
+
+def add_note_to_anki(note: dict[str, Any]) -> int:
+    settings.apply_to_env()
+    connect_url = os.getenv("ANKI_CONNECT_URL", "").strip()
+    if not connect_url:
+        raise RuntimeError("AnkiConnect URL is not configured")
+
+    deck = os.getenv("ANKI_DECK", "Default").strip() or "Default"
+    payload = {
+        "action": "addNote",
+        "version": 6,
+        "params": {
+            "note": {
+                "deckName": deck,
+                "modelName": "Basic",
+                "fields": {
+                    "Front": note["front"],
+                    "Back": note["back"],
+                },
+                "tags": _anki_tags(note),
+                "options": {"allowDuplicate": False},
+            }
+        },
+    }
+    req = urlrequest.Request(
+        connect_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=10) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except URLError as exc:
+        raise RuntimeError(f"AnkiConnect request failed: {exc}") from exc
+
+    if result.get("error"):
+        raise RuntimeError(f"AnkiConnect error: {result['error']}")
+    return int(result["result"])
 
 
 if WEB_DIR.exists():
@@ -106,6 +183,8 @@ def save_settings(patch: SettingsPatch) -> dict[str, Any]:
         "whisper_model": "WHISPER_MODEL",
         "claude_model": "CLAUDE_MODEL",
         "gpt_model": "GPT_MODEL",
+        "anki_connect_url": "ANKI_CONNECT_URL",
+        "anki_deck": "ANKI_DECK",
     }
     provided = patch.model_dump(exclude_unset=True)
     updates = {env: provided[field] for field, env in field_to_env.items() if field in provided}
@@ -119,19 +198,24 @@ def clips() -> list[dict[str, Any]]:
 
 @app.post("/api/upload")
 async def upload_clip(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     capture_timestamp: str | None = Form(default=None),
     device_id: str | None = Form(default=None),
+    auto_process: bool = Form(default=True),
 ) -> dict[str, Any]:
     suffix = Path(file.filename or "clip.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         temp_path = Path(tmp.name)
         shutil.copyfileobj(file.file, tmp)
     try:
+        validate_wav_upload(temp_path)
         clip = add_clip(temp_path, file.filename or "clip.wav", capture_timestamp=capture_timestamp)
         if device_id:
             clip["device_id"] = device_id
             update_clip(clip["id"], {"device_id": device_id})
+        if auto_process:
+            background_tasks.add_task(auto_process_clip, clip["id"], capture_timestamp)
         return {"id": clip["id"], "status": clip["status"], "server_time": utc_now()}
     finally:
         temp_path.unlink(missing_ok=True)
@@ -209,6 +293,42 @@ def patch_clip(clip_id: str, patch: ClipPatch) -> dict[str, Any]:
 @app.post("/api/clips/{clip_id}/approve")
 def approve_clip(clip_id: str) -> dict[str, Any]:
     return update_clip(clip_id, {"status": "approved"})
+
+
+@app.post("/api/clips/{clip_id}/save-to-anki")
+def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
+    clip = find_clip(clip_id)
+    note = clip.get("anki")
+    if not note:
+        front = clip.get("card_front") or clip.get("corrected_word")
+        if front and clip.get("swedish_definition") and clip.get("english_definition"):
+            note = {
+                "front": front,
+                "back": f"SWE: {clip['swedish_definition']}<br>ENG: {clip['english_definition']}",
+                "tags": f"svenska wordclip week::{clip.get('iso_week', 'unsorted')}",
+            }
+            clip = update_clip(clip_id, {"anki": note})
+    if not note:
+        raise HTTPException(status_code=400, detail="No Anki note is ready for this clip")
+
+    settings.apply_to_env()
+    if not os.getenv("ANKI_CONNECT_URL", "").strip():
+        return update_clip(clip_id, {"status": "approved", "anki_save_mode": "csv"})
+
+    try:
+        note_id = add_note_to_anki(note)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return update_clip(
+        clip_id,
+        {
+            "status": "exported",
+            "anki_save_mode": "ankiconnect",
+            "anki_note_id": note_id,
+            "anki_saved_at": utc_now(),
+        },
+    )
 
 
 @app.delete("/api/clips/{clip_id}", status_code=204)

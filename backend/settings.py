@@ -30,7 +30,8 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 
 SECRET_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 MODEL_KEYS = ("WHISPER_MODEL", "CLAUDE_MODEL", "GPT_MODEL")
-MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS
+ANKI_KEYS = ("ANKI_CONNECT_URL", "ANKI_DECK")
+MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS + ANKI_KEYS
 
 _MODEL_DEFAULTS = {
     "WHISPER_MODEL": DEFAULT_WHISPER_MODEL,
@@ -118,4 +119,11 @@ def status() -> dict[str, Any]:
             "is_default": not bool(value),
         }
 
-    return {"secrets": secrets, "models": models}
+    return {
+        "secrets": secrets,
+        "models": models,
+        "anki": {
+            "connect_url": os.getenv("ANKI_CONNECT_URL", ""),
+            "deck": os.getenv("ANKI_DECK", "Default"),
+        },
+    }

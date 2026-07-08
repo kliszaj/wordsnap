@@ -14,6 +14,12 @@ function statusClass(status) {
   return "status";
 }
 
+function isTypingTarget(target) {
+  if (!target) return false;
+  if (target.closest?.(".queue-item")) return false;
+  return ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "A", "AUDIO"].includes(target.tagName) || target.isContentEditable;
+}
+
 function clipNumber(clip, index) {
   const match = clip.original_name?.match(/(\d{3,})/);
   if (match) return match[1].slice(-3);
@@ -45,6 +51,10 @@ function setMetrics() {
   ).padStart(2, "0")}]`;
 }
 
+function hasProcessingClips() {
+  return clips.some((clip) => ["uploaded", "processing"].includes(clip.status));
+}
+
 async function request(path, options = {}) {
   const response = await fetch(path, {
     headers: options.body instanceof FormData ? {} : { "Content-Type": "application/json" },
@@ -64,6 +74,32 @@ async function loadClips() {
     selectedClipId = clips[0]?.id || null;
   }
   render();
+}
+
+function selectClipAt(index) {
+  if (!clips.length) return;
+  const nextIndex = Math.max(0, Math.min(clips.length - 1, index));
+  selectedClipId = clips[nextIndex].id;
+  render();
+  document.querySelector(".queue-item.active")?.scrollIntoView({ block: "nearest" });
+}
+
+function selectedClipIndex() {
+  return clips.findIndex((clip) => clip.id === selectedClipId);
+}
+
+async function toggleSelectedClipSaved() {
+  const clip = clips.find((item) => item.id === selectedClipId);
+  if (!clip) return;
+  if (["approved", "exported"].includes(clip.status)) {
+    await request(`/api/clips/${clip.id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ status: "needs_review" }),
+    });
+  } else {
+    await request(`/api/clips/${clip.id}/save-to-anki`, { method: "POST", body: JSON.stringify({}) });
+  }
+  await loadClips();
 }
 
 function renderQueue() {
@@ -120,7 +156,7 @@ function renderDetail() {
   node.querySelector(".audio").src = `/api/clips/${clip.id}/audio`;
 
   const transcript = node.querySelector(".transcript");
-  const cardFront = node.querySelector(".card-front");
+  const cardFront = node.querySelector(".card-front") || node.querySelector(".corrected-word");
   const swedish = node.querySelector(".swedish-definition");
   const english = node.querySelector(".english-definition");
 
@@ -154,7 +190,7 @@ function renderDetail() {
         english_definition: english.value,
       }),
     });
-    await request(`/api/clips/${clip.id}/approve`, { method: "POST", body: JSON.stringify({}) });
+    await request(`/api/clips/${clip.id}/save-to-anki`, { method: "POST", body: JSON.stringify({}) });
     await loadClips();
   });
 
@@ -195,6 +231,8 @@ const inputOpenai = document.querySelector("#input-openai");
 const inputClaudeModel = document.querySelector("#input-claude-model");
 const inputWhisperModel = document.querySelector("#input-whisper-model");
 const inputGptModel = document.querySelector("#input-gpt-model");
+const inputAnkiConnectUrl = document.querySelector("#input-anki-connect-url");
+const inputAnkiDeck = document.querySelector("#input-anki-deck");
 const statusAnthropic = document.querySelector("#status-anthropic");
 const statusOpenai = document.querySelector("#status-openai");
 
@@ -209,10 +247,20 @@ function renderSettings(data) {
   inputClaudeModel.placeholder = data.models.claude.value;
   inputWhisperModel.placeholder = data.models.whisper.value;
   inputGptModel.placeholder = data.models.gpt.value;
+  inputAnkiConnectUrl.placeholder = data.anki.connect_url || "http://10.0.0.x:8765";
+  inputAnkiDeck.placeholder = data.anki.deck || "Default";
 }
 
 function clearSettingsInputs() {
-  for (const el of [inputAnthropic, inputOpenai, inputClaudeModel, inputWhisperModel, inputGptModel]) {
+  for (const el of [
+    inputAnthropic,
+    inputOpenai,
+    inputClaudeModel,
+    inputWhisperModel,
+    inputGptModel,
+    inputAnkiConnectUrl,
+    inputAnkiDeck,
+  ]) {
     el.value = "";
   }
 }
@@ -237,6 +285,8 @@ async function saveSettings() {
     [inputClaudeModel, "claude_model"],
     [inputWhisperModel, "whisper_model"],
     [inputGptModel, "gpt_model"],
+    [inputAnkiConnectUrl, "anki_connect_url"],
+    [inputAnkiDeck, "anki_deck"],
   ];
   for (const [el, key] of fields) {
     const value = el.value.trim();
@@ -260,3 +310,22 @@ async function saveSettings() {
 settingsOpen?.addEventListener("click", openSettings);
 settingsClose?.addEventListener("click", () => settingsDialog.close());
 settingsSave?.addEventListener("click", saveSettings);
+
+document.addEventListener("keydown", async (event) => {
+  if (isTypingTarget(event.target) || settingsDialog.open) return;
+  if (event.key === "ArrowDown") {
+    event.preventDefault();
+    selectClipAt(selectedClipIndex() + 1);
+  } else if (event.key === "ArrowUp") {
+    event.preventDefault();
+    selectClipAt(selectedClipIndex() - 1);
+  } else if (event.code === "Space") {
+    event.preventDefault();
+    await toggleSelectedClipSaved();
+  }
+});
+
+setInterval(() => {
+  if (!hasProcessingClips() || isTypingTarget(document.activeElement) || settingsDialog.open) return;
+  loadClips().catch(() => {});
+}, 5000);
