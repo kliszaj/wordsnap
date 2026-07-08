@@ -8,34 +8,28 @@
   </head>
   <body>
     <main class="shell">
-      <section class="hero">
+      <header class="app-header">
         <div>
           <p class="eyebrow">Hoth receiver</p>
-          <h1>Correct the word. Then make the card.</h1>
-          <p class="lede">
-            Clips land in the ledger first. Pick one, play it, fix the transcript, send the corrected
-            word through Claude, then approve the compact SWE/ENG card for Anki.
-          </p>
+          <h1>Review ledger</h1>
         </div>
-        <aside class="device-preview" aria-label="Device UI preview">
-          <div class="upload-pill">Upload <span id="pending-count">[00]</span></div>
-          <button class="record-orb" type="button" aria-label="Record preview"></button>
-          <div class="device-readout">tap record<br />tap stop</div>
-        </aside>
-      </section>
-
-      <section class="toolbar" aria-label="Dashboard actions">
-        <div class="metric">
-          <span id="metric-total">00</span>
-          <label>clips</label>
-        </div>
-        <div class="metric">
-          <span id="metric-review">00</span>
-          <label>review</label>
-        </div>
-        <div class="metric">
-          <span id="metric-approved">00</span>
-          <label>approved</label>
+        <div class="metric-strip" aria-label="Dashboard metrics">
+          <div class="metric">
+            <span id="metric-total">00</span>
+            <label>clips</label>
+          </div>
+          <div class="metric">
+            <span id="metric-review">00</span>
+            <label>review</label>
+          </div>
+          <div class="metric">
+            <span id="metric-approved">00</span>
+            <label>approved</label>
+          </div>
+          <div class="metric">
+            <span id="pending-count">[00]</span>
+            <label>pending</label>
+          </div>
         </div>
         <div class="toolbar-actions">
           <a class="ghost-button" href="/assets/directions.html">UI directions</a>
@@ -45,13 +39,13 @@
           </label>
           <a class="ghost-button strong" href="/api/export/anki.csv">Export CSV</a>
         </div>
-      </section>
+      </header>
 
       <section class="review-board" aria-label="Clip review ledger">
         <div class="board-head">
           <div>
-            <p class="eyebrow">Review ledger</p>
-            <h2>Clips and cards</h2>
+            <p class="eyebrow">Selected workflow</p>
+            <h2>Transcribe, translate, send.</h2>
           </div>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
@@ -95,40 +89,71 @@
           <audio class="audio" controls preload="none"></audio>
         </div>
 
-        <div class="pipeline-labels" aria-hidden="true">
-          <span>01 transcription</span>
-          <span>02 translation</span>
-          <span>03 Anki library</span>
-        </div>
+        <div class="paper-pipeline" aria-label="Paper tape pipeline">
+          <section class="tape-card">
+            <div class="punches" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="card-head">
+              <span class="stage-number">01</span>
+              <div>
+                <h3>Transcription</h3>
+                <p>Play the clip and fix what Whisper heard before any card is made.</p>
+              </div>
+            </div>
+            <label>
+              Transcript correction
+              <textarea class="transcript" rows="7"></textarea>
+            </label>
+            <label>
+              Corrected word
+              <input class="corrected-word" />
+            </label>
+            <button class="save" type="button">Save transcript</button>
+          </section>
 
-        <div class="fields">
-          <label class="wide">
-            Transcript correction
-            <textarea class="transcript" rows="4"></textarea>
-          </label>
-          <label>
-            Corrected word
-            <input class="corrected-word" />
-          </label>
-          <label class="wide">
-            Swedish explanation
-            <textarea class="swedish-definition" rows="4"></textarea>
-          </label>
-          <label>
-            English word
-            <input class="english-definition" />
-          </label>
-        </div>
+          <section class="tape-card">
+            <div class="punches" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="card-head">
+              <span class="stage-number">02</span>
+              <div>
+                <h3>Translation</h3>
+                <p>Claude turns the corrected Swedish word into the compact SWE/ENG back.</p>
+              </div>
+            </div>
+            <label>
+              Swedish explanation
+              <textarea class="swedish-definition" rows="7"></textarea>
+            </label>
+            <label>
+              English word
+              <input class="english-definition" />
+            </label>
+            <button class="process" type="button">Reprocess with Claude</button>
+          </section>
 
-        <div class="anki-preview" aria-label="Anki preview">
-          <div class="front"></div>
-          <div class="back"></div>
-        </div>
-
-        <div class="clip-actions">
-          <button class="process" type="button">Reprocess with Claude</button>
-          <button class="save" type="button">Save edits</button>
-          <button class="approve" type="button">Approve card</button>
+          <section class="tape-card">
+            <div class="punches" aria-hidden="true">
+              <span></span><span></span><span></span><span></span><span></span>
+              <span></span><span></span><span></span><span></span><span></span>
+            </div>
+            <div class="card-head">
+              <span class="stage-number">03</span>
+              <div>
+                <h3>Anki library</h3>
+                <p>Approve the exact front/back that will be exported or sent later.</p>
+              </div>
+            </div>
+            <div class="anki-preview" aria-label="Anki preview">
+              <div class="front"></div>
+              <div class="back"></div>
+            </div>
+            <button class="approve" type="button">Approve card</button>
+          </section>
         </div>
         <p class="error"></p>
       </article>
