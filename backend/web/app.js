@@ -11,7 +11,22 @@ function statusClass(status) {
   if (status === "approved") return "status approved";
   if (status === "error") return "status error";
   if (status === "exported") return "status exported";
+  if (["processed", "needs_review"].includes(status)) return "status ready";
+  if (status === "processing") return "status processing";
   return "status";
+}
+
+function statusLabel(status) {
+  const labels = {
+    uploaded: "uploaded",
+    processing: "processing",
+    processed: "ready",
+    needs_review: "ready",
+    approved: "csv ready",
+    exported: "saved",
+    error: "error",
+  };
+  return labels[status] || status || "unknown";
 }
 
 function isTypingTarget(target) {
@@ -40,11 +55,11 @@ function ankiBack(clip) {
 
 function setMetrics() {
   document.querySelector("#metric-total").textContent = String(clips.length).padStart(2, "0");
-  document.querySelector("#metric-review").textContent = String(
+  document.querySelector("#metric-ready").textContent = String(
     clips.filter((clip) => ["processed", "needs_review"].includes(clip.status)).length,
   ).padStart(2, "0");
-  document.querySelector("#metric-approved").textContent = String(
-    clips.filter((clip) => clip.status === "approved").length,
+  document.querySelector("#metric-saved").textContent = String(
+    clips.filter((clip) => ["approved", "exported"].includes(clip.status)).length,
   ).padStart(2, "0");
   document.querySelector("#pending-count").textContent = `[${String(
     clips.filter((clip) => clip.status !== "approved" && clip.status !== "exported").length,
@@ -90,15 +105,8 @@ function selectedClipIndex() {
 
 async function toggleSelectedClipSaved() {
   const clip = clips.find((item) => item.id === selectedClipId);
-  if (!clip) return;
-  if (["approved", "exported"].includes(clip.status)) {
-    await request(`/api/clips/${clip.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({ status: "needs_review" }),
-    });
-  } else {
-    await request(`/api/clips/${clip.id}/save-to-anki`, { method: "POST", body: JSON.stringify({}) });
-  }
+  if (!clip || clip.status === "exported") return;
+  await request(`/api/clips/${clip.id}/save-to-anki`, { method: "POST", body: JSON.stringify({}) });
   await loadClips();
 }
 
@@ -121,7 +129,7 @@ function renderQueue() {
     node.querySelector(".queue-meta").textContent = clip.iso_week || "unsorted";
     const status = node.querySelector(".status");
     status.className = statusClass(clip.status);
-    status.textContent = clip.status;
+    status.textContent = statusLabel(clip.status);
     item.addEventListener("click", () => {
       selectedClipId = clip.id;
       render();
@@ -152,7 +160,7 @@ function renderDetail() {
   node.querySelector(".clip-meta").textContent = `${clip.original_name} · ${clip.iso_week || "unsorted"}`;
   const status = node.querySelector(".status");
   status.className = statusClass(clip.status);
-  status.textContent = clip.status;
+  status.textContent = statusLabel(clip.status);
   node.querySelector(".audio").src = `/api/clips/${clip.id}/audio`;
 
   const transcript = node.querySelector(".transcript");
@@ -180,7 +188,15 @@ function renderDetail() {
     await loadClips();
   });
 
-  node.querySelector(".save-anki").addEventListener("click", async () => {
+  const saveButton = node.querySelector(".save-anki");
+  if (clip.status === "exported") {
+    saveButton.textContent = "Saved to Anki";
+    saveButton.disabled = true;
+  } else if (clip.status === "approved") {
+    saveButton.textContent = "Ready for CSV";
+  }
+
+  saveButton.addEventListener("click", async () => {
     await request(`/api/clips/${clip.id}`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -194,7 +210,7 @@ function renderDetail() {
     await loadClips();
   });
 
-  node.querySelector(".error").textContent = clip.error || "";
+  node.querySelector(".error").textContent = clip.error || clip.anki_sync_error || "";
   detail.append(node);
 }
 
@@ -235,6 +251,9 @@ const inputAnkiConnectUrl = document.querySelector("#input-anki-connect-url");
 const inputAnkiDeck = document.querySelector("#input-anki-deck");
 const statusAnthropic = document.querySelector("#status-anthropic");
 const statusOpenai = document.querySelector("#status-openai");
+const statusAnkiConnect = document.querySelector("#status-anki-connect");
+const statusAnkiDeck = document.querySelector("#status-anki-deck");
+const statusAnkiLastSave = document.querySelector("#status-anki-last-save");
 
 function renderSecretStatus(el, secret) {
   el.textContent = secret.configured ? `set · ${secret.hint}` : "not set";
@@ -249,6 +268,12 @@ function renderSettings(data) {
   inputGptModel.placeholder = data.models.gpt.value;
   inputAnkiConnectUrl.placeholder = data.anki.connect_url || "http://10.0.0.x:8765";
   inputAnkiDeck.placeholder = data.anki.deck || "Default";
+  const connection = data.anki.connection || {};
+  statusAnkiConnect.textContent = connection.connected ? `connected · v${connection.version}` : connection.error || "not connected";
+  statusAnkiConnect.className = `settings-status ${connection.connected ? "ok" : "missing"}`;
+  statusAnkiDeck.textContent = connection.deck_exists ? "found" : "will create on save";
+  statusAnkiDeck.className = `settings-status ${connection.deck_exists ? "ok" : "missing"}`;
+  statusAnkiLastSave.textContent = connection.last_saved_at || "none yet";
 }
 
 function clearSettingsInputs() {

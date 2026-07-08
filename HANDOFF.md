@@ -343,23 +343,24 @@ docker compose -f docker-compose.build.yml up -d
 
 ## What Is Next
 
-Recommended order:
+Completed in the follow-up pass after the live Anki test:
 
-1. Auto-create missing Anki decks before saving a card.
-2. Auto-sync Anki after successful save so the phone can pull immediately.
-3. Clean up remaining internal/UI language from review/approve to ready/saved/error.
-4. Add an Anki status check in Settings:
-   - connected
-   - deck found
-   - last save result
-5. Push/pull/restart the newest WordSnap Docker image on Hoth after each backend/UI deployment.
-6. Record a new device clip and run the full fresh path:
+- WordSnap now creates a missing Anki deck before saving.
+- WordSnap calls AnkiConnect `sync` after a successful note save and records sync metadata.
+- The web UI now displays ready/saved/error language instead of the old review/approved wording.
+- Settings now shows AnkiConnect status, deck presence, and last Anki save.
+- The checked-in Unraid compose includes the Anki desktop container on host port `3010`.
+
+Recommended next order:
+
+1. Push/pull/restart the newest WordSnap Docker image on Hoth after each backend/UI deployment.
+2. Record a new device clip and run the full fresh path:
    - record
    - tap upload
    - confirm auto-process
    - save to Anki
    - sync phone
-7. Continue device UI design states:
+3. Continue device UI design states:
    - idle/ready
    - recording
    - saved

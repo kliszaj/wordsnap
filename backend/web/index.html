@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>WordSnap Hoth</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=20260708-2" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260708-3" />
   </head>
   <body>
     <main class="shell">
@@ -19,12 +19,12 @@
             <label>clips</label>
           </div>
           <div class="metric">
-            <span id="metric-review">00</span>
-            <label>review</label>
+            <span id="metric-ready">00</span>
+            <label>ready</label>
           </div>
           <div class="metric">
-            <span id="metric-approved">00</span>
-            <label>approved</label>
+            <span id="metric-saved">00</span>
+            <label>saved</label>
           </div>
           <div class="metric">
             <span id="pending-count">[00]</span>
@@ -100,13 +100,16 @@
         <fieldset class="settings-group">
           <legend>Anki destination</legend>
           <label class="settings-field">
-            <span class="settings-label">AnkiConnect URL</span>
+            <span class="settings-label">AnkiConnect URL <em class="settings-status" id="status-anki-connect"></em></span>
             <input type="url" id="input-anki-connect-url" autocomplete="off" spellcheck="false" placeholder="http://10.0.0.x:8765" />
           </label>
           <label class="settings-field">
-            <span class="settings-label">Deck name</span>
+            <span class="settings-label">Deck name <em class="settings-status" id="status-anki-deck"></em></span>
             <input type="text" id="input-anki-deck" autocomplete="off" spellcheck="false" placeholder="Default" />
           </label>
+          <div class="settings-field">
+            <span class="settings-label">Last Anki save <em class="settings-status" id="status-anki-last-save"></em></span>
+          </div>
         </fieldset>
 
         <div class="settings-actions">
@@ -205,6 +208,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260708-2"></script>
+    <script src="/assets/app.js?v=20260708-3"></script>
   </body>
 </html>

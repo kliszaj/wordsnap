@@ -100,17 +100,46 @@ def _anki_tags(note: dict[str, Any]) -> list[str]:
     return [tag for tag in str(tags).split() if tag]
 
 
-def add_note_to_anki(note: dict[str, Any]) -> int:
+def anki_action(action: str, params: dict[str, Any] | None = None, timeout: int = 10) -> Any:
     settings.apply_to_env()
     connect_url = os.getenv("ANKI_CONNECT_URL", "").strip()
     if not connect_url:
         raise RuntimeError("AnkiConnect URL is not configured")
 
+    payload: dict[str, Any] = {"action": action, "version": 6}
+    if params is not None:
+        payload["params"] = params
+    req = urlrequest.Request(
+        connect_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except URLError as exc:
+        raise RuntimeError(f"AnkiConnect request failed: {exc}") from exc
+
+    if result.get("error"):
+        raise RuntimeError(f"AnkiConnect error: {result['error']}")
+    return result.get("result")
+
+
+def ensure_anki_deck(deck: str) -> None:
+    decks = anki_action("deckNames", timeout=5)
+    if deck in decks:
+        return
+    anki_action("createDeck", {"deck": deck}, timeout=10)
+
+
+def add_note_to_anki(note: dict[str, Any]) -> int:
+    settings.apply_to_env()
     deck = os.getenv("ANKI_DECK", "Default").strip() or "Default"
-    payload = {
-        "action": "addNote",
-        "version": 6,
-        "params": {
+    ensure_anki_deck(deck)
+    result = anki_action(
+        "addNote",
+        {
             "note": {
                 "deckName": deck,
                 "modelName": "Basic",
@@ -122,22 +151,45 @@ def add_note_to_anki(note: dict[str, Any]) -> int:
                 "options": {"allowDuplicate": False},
             }
         },
-    }
-    req = urlrequest.Request(
-        connect_url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
     )
-    try:
-        with urlrequest.urlopen(req, timeout=10) as response:
-            result = json.loads(response.read().decode("utf-8"))
-    except URLError as exc:
-        raise RuntimeError(f"AnkiConnect request failed: {exc}") from exc
+    return int(result)
 
-    if result.get("error"):
-        raise RuntimeError(f"AnkiConnect error: {result['error']}")
-    return int(result["result"])
+
+def sync_anki() -> tuple[bool, str | None]:
+    try:
+        anki_action("sync", timeout=30)
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+
+
+def anki_connection_status() -> dict[str, Any]:
+    settings.apply_to_env()
+    connect_url = os.getenv("ANKI_CONNECT_URL", "").strip()
+    deck = os.getenv("ANKI_DECK", "Default").strip() or "Default"
+    latest_save = max(
+        (clip.get("anki_saved_at", "") for clip in load_clips() if clip.get("anki_saved_at")),
+        default="",
+    )
+    status: dict[str, Any] = {
+        "configured": bool(connect_url),
+        "connected": False,
+        "deck": deck,
+        "deck_exists": False,
+        "version": None,
+        "last_saved_at": latest_save,
+        "error": "",
+    }
+    if not connect_url:
+        status["error"] = "AnkiConnect URL is not configured"
+        return status
+    try:
+        status["version"] = anki_action("version", timeout=3)
+        status["connected"] = True
+        status["deck_exists"] = deck in anki_action("deckNames", timeout=5)
+    except Exception as exc:
+        status["error"] = str(exc)
+    return status
 
 
 if WEB_DIR.exists():
@@ -162,13 +214,17 @@ def device_status() -> dict[str, Any]:
         "uploaded_clips": len(clips),
         "needs_review": len([clip for clip in clips if clip["status"] in {"processed", "needs_review"}]),
         "approved": len([clip for clip in clips if clip["status"] == "approved"]),
+        "ready": len([clip for clip in clips if clip["status"] in {"processed", "needs_review"}]),
+        "saved": len([clip for clip in clips if clip["status"] in {"approved", "exported"}]),
     }
 
 
 @app.get("/api/settings")
 def get_settings() -> dict[str, Any]:
     """Masked view of configured credentials + effective models (no raw secrets)."""
-    return settings.status()
+    data = settings.status()
+    data["anki"]["connection"] = anki_connection_status()
+    return data
 
 
 @app.post("/api/settings")
@@ -188,7 +244,9 @@ def save_settings(patch: SettingsPatch) -> dict[str, Any]:
     }
     provided = patch.model_dump(exclude_unset=True)
     updates = {env: provided[field] for field, env in field_to_env.items() if field in provided}
-    return settings.update_settings(updates)
+    data = settings.update_settings(updates)
+    data["anki"]["connection"] = anki_connection_status()
+    return data
 
 
 @app.get("/api/clips")
@@ -320,15 +378,19 @@ def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return update_clip(
-        clip_id,
-        {
-            "status": "exported",
-            "anki_save_mode": "ankiconnect",
-            "anki_note_id": note_id,
-            "anki_saved_at": utc_now(),
-        },
-    )
+    synced, sync_error = sync_anki()
+    updates = {
+        "status": "exported",
+        "anki_save_mode": "ankiconnect",
+        "anki_note_id": note_id,
+        "anki_saved_at": utc_now(),
+    }
+    if synced:
+        updates["anki_synced_at"] = utc_now()
+        updates["anki_sync_error"] = ""
+    else:
+        updates["anki_sync_error"] = sync_error or "Anki sync failed"
+    return update_clip(clip_id, updates)
 
 
 @app.delete("/api/clips/{clip_id}", status_code=204)

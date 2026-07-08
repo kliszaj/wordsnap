@@ -382,7 +382,15 @@ h2 {
 }
 
 .status.exported {
+  color: var(--good);
+}
+
+.status.ready {
   color: var(--warning);
+}
+
+.status.processing {
+  color: #cfc9ff;
 }
 
 .status.error {
@@ -562,6 +570,14 @@ textarea {
 .save-anki {
   background: rgba(118, 198, 154, 0.14);
   color: #c6f1d7;
+}
+
+.save-anki:disabled {
+  cursor: default;
+  border-color: rgba(118, 198, 154, 0.28);
+  background: rgba(118, 198, 154, 0.08);
+  color: var(--good);
+  transform: none;
 }
 
 .error {

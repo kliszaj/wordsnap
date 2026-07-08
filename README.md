@@ -6,7 +6,7 @@ WordSnap is a handheld Swedish vocabulary capture pipeline:
 2. Hoth/Unraid receiver accepts uploads.
 3. OpenAI Whisper transcribes Swedish audio.
 4. Claude enriches the target word.
-5. The web UI lets you correct, reprocess, approve, and export Anki cards.
+5. The web UI lets you correct, reprocess, and save cards directly to Anki.
 
 ## Local Backend Setup
 
@@ -17,8 +17,8 @@ OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
 WHISPER_MODEL=whisper-1
 CLAUDE_MODEL=claude-sonnet-5
-ANKI_CONNECT_URL=
-ANKI_DECK=Default
+ANKI_CONNECT_URL=http://anki:8765
+ANKI_DECK=Swedish::WordSnap
 ```
 
 Install and run:
@@ -64,14 +64,15 @@ SWE: lätt att förstå.
 ENG: comprehensible.
 ```
 
-Export approved cards:
+Export CSV fallback cards:
 
 ```powershell
 backend\.venv\Scripts\python.exe backend\export_anki_csv.py backend\data\exports\anki-approved.csv
 ```
 
-If `ANKI_CONNECT_URL` is configured, `Save to Anki` sends directly to that AnkiConnect endpoint and deck.
-If it is blank, `Save to Anki` marks the card approved for CSV export.
+If `ANKI_CONNECT_URL` is configured, `Save to Anki` sends directly to that AnkiConnect endpoint and deck,
+creates the deck if it is missing, and asks Anki to sync after the note is saved.
+If it is blank, `Save to Anki` marks the card ready for CSV export.
 
 ## Docker Image
 
@@ -97,7 +98,8 @@ docker push $env:WORDSNAP_IMAGE
 
 ## Hoth / Unraid
 
-`docker-compose.unraid.yml` is the Hoth-ready deploy file. It pulls the Docker Hub image instead of building on the server.
+`docker-compose.unraid.yml` is the Hoth-ready deploy file. It pulls the Docker Hub image instead of building on the server
+and runs Anki Desktop next to WordSnap.
 
 Create `backend/.env` on Hoth with the same values as local setup, then point `WORDSNAP_DATA_DIR` at your appdata share if you do not want to use `./backend/data`.
 
@@ -108,7 +110,26 @@ docker compose -f docker-compose.unraid.yml pull
 docker compose -f docker-compose.unraid.yml up -d
 ```
 
-The container serves the review UI on `http://<hoth-ip>:8080` and exposes `/api/health` for compose healthchecks.
+The WordSnap UI is exposed on:
+
+```text
+http://<hoth-ip>:8090
+```
+
+The Anki desktop UI is exposed on:
+
+```text
+http://<hoth-ip>:3010
+```
+
+Install AnkiConnect inside the Anki UI if it is not already present:
+
+1. Tools -> Add-ons -> Get Add-ons
+2. Enter add-on code `2055492159`
+3. Restart Anki
+4. Log into AnkiWeb
+
+WordSnap reaches AnkiConnect internally at `http://anki:8765`; do not expose port `8765` to the LAN unless debugging.
 
 ## Device UI
 

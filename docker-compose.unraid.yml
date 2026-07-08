@@ -6,7 +6,27 @@ services:
     user: "99:100"
     environment:
       DATA_DIR: /app/data
+      ANKI_CONNECT_URL: http://anki:8765
+      ANKI_DECK: Swedish::WordSnap
     ports:
       - "8090:8080"
     volumes:
       - /mnt/user/appdata/wordsnap/data:/app/data
+    depends_on:
+      - anki
+
+  anki:
+    image: chrislongros/anki-desktop:latest
+    container_name: wordsnap-anki
+    restart: unless-stopped
+    environment:
+      PUID: 99
+      PGID: 100
+      TZ: Europe/Stockholm
+    ports:
+      - "3010:3000"
+    volumes:
+      - /mnt/user/appdata/wordsnap/anki:/config
+    security_opt:
+      - seccomp=unconfined
+    shm_size: 1gb
