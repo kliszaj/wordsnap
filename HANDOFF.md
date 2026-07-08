@@ -4,10 +4,10 @@ Context for picking up this project. Goal (per [prd-wordclip.md](prd-wordclip.md
 ESP32-C6 device captures spoken Swedish words, uploads clips to a self-hosted Hoth/Unraid pipeline,
 transcribes with Whisper, enriches with Claude, and produces reviewable Anki cards sorted by ISO week.
 
-Latest pushed commit at handoff time:
+Latest pushed commit at handoff time before this touch pass:
 
 ```text
-14ea6ec Add Hoth review UI and device UI scaffold
+4138f1f Prototype cassette UI directions
 ```
 
 Repo: <https://github.com/kliszaj/wordsnap>
@@ -19,8 +19,8 @@ Repo: <https://github.com/kliszaj/wordsnap>
 | Piece | State |
 |---|---|
 | Device audio capture to SD | Working and previously verified on hardware |
-| Device visual UI scaffold | Added and builds; BOOT button proxies future touch start/stop |
-| Touchscreen input | Not wired yet; needs exact Waveshare touch controller/pins/example |
+| Device visual UI scaffold | Added and builds; touchscreen starts/stops recording; BOOT remains fallback |
+| Touchscreen input | Wired for CST816 touch hit-testing on record/upload targets |
 | Device WiFi upload | API contract and firmware stub exist; transport not implemented |
 | Backend Claude pipeline | Working; Claude selected as enrichment provider |
 | Hoth receiver API | Implemented with FastAPI and local JSON/file store |
@@ -50,6 +50,7 @@ Repo: <https://github.com/kliszaj/wordsnap>
 
 Board: **Waveshare ESP32-C6-Touch-LCD-1.83** on **COM3** via native USB-Serial-JTAG.
 LCD: 240×284 ST7789.
+Touch: CST816D/CST816S-compatible capacitive controller over I2C.
 
 Confirmed pins used so far:
 
@@ -58,6 +59,7 @@ Confirmed pins used so far:
 - SD: CS=17
 - I2S: MCLK=19, BCLK=20, WS=22, DIN=21
 - codec I2C: SDA=7, SCL=8
+- touch I2C: shared SDA=7, SCL=8; INT=11; reset left unmanaged (`-1`) per Waveshare ESP-IDF example because GPIO4 is already LCD reset
 - BOOT button: GPIO9
 - ES7210 mic-array ADC: I2C `0x40`
 
@@ -93,12 +95,12 @@ Main file: [firmware/main/main.c](firmware/main/main.c)
 Current behavior:
 
 - Boots, mounts SD, initializes ES7210 audio.
+- Initializes CST816 touch on the shared I2C bus.
 - Draws WordSnap-style home screen:
   - upload pill shape
   - large red record circle
-- BOOT button currently mirrors the future touchscreen record action.
-- Press BOOT to start recording.
-- Release, then press BOOT again to stop early.
+- Tap the red record circle, or press BOOT, to start recording.
+- Tap the recording screen, or release then press BOOT again, to stop early.
 - Safety cap is `MAX_RECORD_SECONDS=15`.
 - WAV header is rewritten after stop so short clips are valid.
 - Recording view draws:
@@ -106,16 +108,23 @@ Current behavior:
   - red REC dot
   - clip-index pill placeholder
 - Upload touch target and upload transport are stubbed:
-  - `touch_record_pressed()`
-  - `touch_upload_pressed()`
+  - upload pill hit-testing exists and calls `upload_pending_clips()`
   - `upload_pending_clips()`
 
-Firmware build passed after adding `esp_timer` to [firmware/main/CMakeLists.txt](firmware/main/CMakeLists.txt).
+Firmware build passed after wiring CST816 touch:
+
+```powershell
+cmd /c "call C:\Users\Adrian\esp\esp-idf\export.bat && idf.py -C firmware build"
+```
 
 Notes for next firmware agent:
 
-1. Confirm the touch controller model and pins from the Waveshare example/schematic.
-2. Wire `touch_record_pressed()` and `touch_upload_pressed()`.
+1. Flash and hardware-test touch coordinates/orientation:
+   - home record circle should start capture
+   - recording screen tap should stop after the 600ms guard
+   - upload pill should enter `upload_pending_clips()`
+   - logs print `touch tap x=... y=...`
+2. If coordinates are rotated/mirrored, adjust `.swap_xy`, `.mirror_x`, or `.mirror_y` in `touch_init()`.
 3. Add text rendering or LVGL for:
    - `Upload [12]`
    - `00:12`
@@ -261,10 +270,9 @@ Start here:
    - Open `http://127.0.0.1:8080`.
    - Ask what feels wrong visually/functionally.
 
-2. **Get Waveshare touch details**
-   - Need exact capacitive touch controller and pins from Waveshare demo/schematic.
-   - Do not invent this. Ask user to provide demo folder or schematic if not locally available.
-   - Then implement real touch hit-testing for record and upload.
+2. **Flash/test firmware touch**
+   - CST816 touch is implemented and builds, but not yet flashed/tested on hardware.
+   - Validate coordinates from logs before tightening hit targets.
 
 3. **Implement device upload transport**
    - Add WiFi config strategy first: hardcoded dev config vs provisioning.
@@ -283,8 +291,8 @@ Start here:
    - Persist `backend/data`.
    - Keep `backend/.env` private.
 
-6. **Flash/test firmware**
-   - Firmware builds but the new UI/stop behavior was not flashed/tested on hardware yet.
+6. **Hardware caution**
+   - Firmware builds but the latest touch behavior was not flashed/tested on hardware yet.
    - Be careful not to open/reset COM3 while the user is actively recording.
 
 ---

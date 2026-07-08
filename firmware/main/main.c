@@ -6,7 +6,7 @@
  *   - Home view: upload pill + large red record button
  *   - Recording view: dark dotted field + stop-capable capture
  *   - microSD (FAT32) over shared SPI2 bus
- *   - BOOT button (GPIO9) currently mirrors touchscreen record/stop until touch driver is wired
+ *   - Capacitive touch starts/stops recording; BOOT (GPIO9) remains a debug fallback
  *
  * Audio: ES7210 4-ch ADC (we use MIC1+MIC2), I2S TDM 2-slot, 16 kHz / 16-bit stereo.
  * Pins (schematic Rev1.2 + Waveshare examples):
@@ -25,6 +25,7 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"
+#include "esp_lcd_touch_cst816s.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include "driver/sdspi_host.h"
@@ -47,6 +48,8 @@ static const char *TAG = "wordclip";
 #define PIN_LCD_BL  6
 #define PIN_SD_CS   17
 #define PIN_BTN     9          /* BOOT button, active-low */
+#define PIN_TOUCH_INT 11
+#define PIN_TOUCH_RST -1       /* Waveshare example leaves CST816 reset unmanaged; GPIO4 is LCD reset */
 
 #define LCD_HOST    SPI2_HOST
 #define LCD_H_RES   240
@@ -82,15 +85,26 @@ static const char *TAG = "wordclip";
 #define C_DARK_RED 0xA145
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_io_handle_t s_touch_io = NULL;
+static esp_lcd_touch_handle_t s_touch = NULL;
+static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static bool s_sd_ok = false;
 static i2s_chan_handle_t s_i2s_rx = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
 static int s_active_clip_index = 0;
+static bool s_recording_active = false;
+static bool s_touch_was_down = false;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
 static int next_index(void);
 static int pending_clip_count(void);
+
+typedef enum {
+    TOUCH_ACTION_NONE = 0,
+    TOUCH_ACTION_RECORD,
+    TOUCH_ACTION_UPLOAD,
+} touch_action_t;
 
 /* ---------------- LCD ---------------- */
 static void lcd_fill(uint16_t color)
@@ -183,17 +197,89 @@ static void ui_show_saved(void)
     ui_show_home();
 }
 
-static bool touch_record_pressed(void)
+/* ---------------- Touch (CST816D/CST816S-compatible controller) ---------------- */
+static bool hit_rect(uint16_t x, uint16_t y, int x0, int y0, int x1, int y1)
 {
-    /* TODO: wire capacitive touch controller and hit-test the record orb.
-     * BOOT mirrors this action for now so the state machine can be tested. */
-    return false;
+    return x >= x0 && x < x1 && y >= y0 && y < y1;
 }
 
-static bool touch_upload_pressed(void)
+static bool hit_disc(uint16_t x, uint16_t y, int cx, int cy, int r)
 {
-    /* TODO: hit-test the upload pill after the touch controller is wired. */
-    return false;
+    int dx = (int)x - cx;
+    int dy = (int)y - cy;
+    return (dx * dx + dy * dy) <= (r * r);
+}
+
+static esp_err_t touch_init(void)
+{
+    ESP_RETURN_ON_FALSE(s_i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "i2c bus not ready for touch");
+
+    esp_lcd_touch_config_t touch_cfg = {
+        .x_max = LCD_H_RES,
+        .y_max = LCD_V_RES,
+        .rst_gpio_num = PIN_TOUCH_RST,
+        .int_gpio_num = PIN_TOUCH_INT,
+        .flags = {
+            .swap_xy = 0,
+            .mirror_x = 0,
+            .mirror_y = 0,
+        },
+    };
+
+    esp_lcd_panel_io_i2c_config_t touch_io_cfg = ESP_LCD_TOUCH_IO_I2C_CST816S_CONFIG();
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i2c(s_i2c_bus, &touch_io_cfg, &s_touch_io),
+                        TAG, "touch i2c io");
+    ESP_RETURN_ON_ERROR(esp_lcd_touch_new_i2c_cst816s(s_touch_io, &touch_cfg, &s_touch),
+                        TAG, "cst816 touch");
+    ESP_LOGI(TAG, "CST816 touch ready on SDA=%d SCL=%d INT=%d", PIN_I2C_SDA, PIN_I2C_SCL, PIN_TOUCH_INT);
+    return ESP_OK;
+}
+
+static bool touch_press_edge(uint16_t *x, uint16_t *y)
+{
+    if (!s_touch) return false;
+
+    esp_err_t err = esp_lcd_touch_read_data(s_touch);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "touch read failed: %s", esp_err_to_name(err));
+        return false;
+    }
+
+    esp_lcd_touch_point_data_t point = {0};
+    uint8_t points = 0;
+    err = esp_lcd_touch_get_data(s_touch, &point, &points, 1);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "touch data failed: %s", esp_err_to_name(err));
+        return false;
+    }
+    if (points == 0) {
+        s_touch_was_down = false;
+        return false;
+    }
+    if (s_touch_was_down) return false;
+
+    s_touch_was_down = true;
+    *x = point.x;
+    *y = point.y;
+    ESP_LOGI(TAG, "touch tap x=%u y=%u", point.x, point.y);
+    return true;
+}
+
+static bool touch_record_pressed(void)
+{
+    uint16_t x = 0, y = 0;
+    if (!touch_press_edge(&x, &y)) return false;
+    if (s_recording_active) return true;
+    return hit_disc(x, y, 120, 178, 70);
+}
+
+static touch_action_t touch_home_action(void)
+{
+    uint16_t x = 0, y = 0;
+    if (!touch_press_edge(&x, &y)) return TOUCH_ACTION_NONE;
+    if (hit_rect(x, y, 29, 32, 211, 78)) return TOUCH_ACTION_UPLOAD;
+    if (hit_disc(x, y, 120, 178, 70)) return TOUCH_ACTION_RECORD;
+    return TOUCH_ACTION_NONE;
 }
 
 static esp_err_t lcd_init(void)
@@ -279,8 +365,7 @@ static esp_err_t audio_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_init_tdm_mode(s_i2s_rx, &tdm_cfg), TAG, "i2s tdm");
 
-    /* I2C master bus for ES7210 control */
-    i2c_master_bus_handle_t i2c_bus = NULL;
+    /* Shared I2C master bus for ES7210 control and CST816 touch. */
     i2c_master_bus_config_t i2c_cfg = {
         .i2c_port = I2C_PORT,
         .sda_io_num = PIN_I2C_SDA,
@@ -289,12 +374,12 @@ static esp_err_t audio_init(void)
         .glitch_ignore_cnt = 7,
         .flags.enable_internal_pullup = true,
     };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &i2c_bus), TAG, "i2c bus");
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
 
     audio_codec_i2c_cfg_t ctrl_cfg = {
         .port = I2C_PORT,
         .addr = ES7210_CODEC_DEFAULT_ADDR,
-        .bus_handle = i2c_bus,
+        .bus_handle = s_i2c_bus,
     };
     const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
     ESP_RETURN_ON_FALSE(ctrl_if, ESP_FAIL, TAG, "es7210 i2c ctrl");
@@ -377,6 +462,7 @@ static void record_wav(int index)
 
     ESP_LOGI(TAG, "Recording max %ds -> %s", MAX_RECORD_SECONDS, path);
     s_active_clip_index = index;
+    s_recording_active = true;
     ui_show_recording(0);
 
     /* drain stale DMA data so the clip starts clean (no pre-roll / startup click) */
@@ -413,6 +499,7 @@ static void record_wav(int index)
     fseek(f, 0, SEEK_SET);
     fwrite(&hdr, sizeof(hdr), 1, f);
     fclose(f);
+    s_recording_active = false;
     ESP_LOGI(TAG, "Saved %s (%" PRIu32 " bytes)", path, written);
     ui_show_saved();
 }
@@ -446,12 +533,16 @@ void app_main(void)
     if (aerr != ESP_OK) {
         ESP_LOGE(TAG, "audio_init failed: %s -- check ES7210 / AXP rails", esp_err_to_name(aerr));
     }
+    esp_err_t terr = touch_init();
+    if (terr != ESP_OK) {
+        ESP_LOGE(TAG, "touch_init failed: %s -- BOOT fallback remains available", esp_err_to_name(terr));
+    }
     bool ready = s_sd_ok && (aerr == ESP_OK);
 
     if (ready) ui_show_home();
     else lcd_fill(C_MAGENTA);
-    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d). Press BOOT to record; press again to stop.",
-             ready, s_sd_ok, aerr == ESP_OK);
+    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d touch=%d). Tap record or press BOOT to record; tap/press again to stop.",
+             ready, s_sd_ok, aerr == ESP_OK, terr == ESP_OK);
 
     gpio_config_t btn = {
         .pin_bit_mask = 1ULL << PIN_BTN,
@@ -468,13 +559,14 @@ void app_main(void)
                      gpio_get_level(PIN_BTN));
         }
         int level = gpio_get_level(PIN_BTN);
-        if (touch_upload_pressed()) {
+        touch_action_t touch_action = touch_home_action();
+        if (touch_action == TOUCH_ACTION_UPLOAD) {
             upload_pending_clips();
             ui_show_home();
         }
-        if (prev == 1 && level == 0) {
+        if ((prev == 1 && level == 0) || touch_action == TOUCH_ACTION_RECORD) {
             vTaskDelay(pdMS_TO_TICKS(30));
-            if (gpio_get_level(PIN_BTN) == 0) {
+            if (touch_action == TOUCH_ACTION_RECORD || gpio_get_level(PIN_BTN) == 0) {
                 if (ready) {
                     record_wav(next_index());
                 } else {
