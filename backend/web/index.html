@@ -11,16 +11,17 @@
       <section class="hero">
         <div>
           <p class="eyebrow">Hoth receiver</p>
-          <h1>Word review before Anki.</h1>
+          <h1>Correct the word. Then make the card.</h1>
           <p class="lede">
-            Uploaded clips land here first. Listen, fix the transcript, reprocess with Claude,
-            then approve the compact SWE/ENG card for Anki import.
+            Clips land in the ledger first. Pick one, play it, fix the transcript, send the corrected
+            word through Claude, then approve the compact SWE/ENG card for Anki.
           </p>
         </div>
-        <div class="device-preview" aria-label="Device UI preview">
+        <aside class="device-preview" aria-label="Device UI preview">
           <div class="upload-pill">Upload <span id="pending-count">[00]</span></div>
           <button class="record-orb" type="button" aria-label="Record preview"></button>
-        </div>
+          <div class="device-readout">tap record<br />tap stop</div>
+        </aside>
       </section>
 
       <section class="toolbar" aria-label="Dashboard actions">
@@ -42,58 +43,92 @@
             Upload WAV
             <input id="file-input" type="file" accept="audio/wav,.wav" multiple />
           </label>
-          <a class="ghost-button" href="/api/export/anki.csv">Export CSV</a>
+          <a class="ghost-button strong" href="/api/export/anki.csv">Export CSV</a>
         </div>
       </section>
 
-      <section class="review-board">
+      <section class="review-board" aria-label="Clip review ledger">
         <div class="board-head">
           <div>
-            <p class="eyebrow">Inbox</p>
+            <p class="eyebrow">Review ledger</p>
             <h2>Clips and cards</h2>
           </div>
           <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
         </div>
-        <div id="clip-list" class="clip-list" aria-live="polite"></div>
+
+        <div class="workbench">
+          <aside class="clip-queue" aria-label="Clip queue">
+            <div class="queue-head">
+              <span>clip</span>
+              <span>status</span>
+            </div>
+            <div id="clip-queue-list" class="clip-queue-list" aria-live="polite"></div>
+          </aside>
+          <section id="clip-detail" class="clip-detail" aria-live="polite"></section>
+        </div>
       </section>
     </main>
 
-    <template id="clip-template">
+    <template id="queue-template">
+      <button class="queue-item" type="button">
+        <span class="queue-number"></span>
+        <span>
+          <strong class="queue-title"></strong>
+          <small class="queue-meta"></small>
+        </span>
+        <span class="status"></span>
+      </button>
+    </template>
+
+    <template id="detail-template">
       <article class="clip">
         <div class="clip-top">
           <div>
+            <p class="eyebrow">Selected clip</p>
             <div class="clip-title"></div>
             <div class="clip-meta"></div>
           </div>
           <span class="status"></span>
         </div>
-        <audio class="audio" controls preload="none"></audio>
+
+        <div class="playback-strip">
+          <audio class="audio" controls preload="none"></audio>
+        </div>
+
+        <div class="pipeline-labels" aria-hidden="true">
+          <span>01 transcription</span>
+          <span>02 translation</span>
+          <span>03 Anki library</span>
+        </div>
+
         <div class="fields">
-          <label>
-            Transcript
-            <textarea class="transcript" rows="2"></textarea>
+          <label class="wide">
+            Transcript correction
+            <textarea class="transcript" rows="4"></textarea>
           </label>
           <label>
             Corrected word
             <input class="corrected-word" />
           </label>
-          <label>
-            SWE
-            <textarea class="swedish-definition" rows="2"></textarea>
+          <label class="wide">
+            Swedish explanation
+            <textarea class="swedish-definition" rows="4"></textarea>
           </label>
           <label>
-            ENG
+            English word
             <input class="english-definition" />
           </label>
         </div>
-        <div class="anki-preview">
+
+        <div class="anki-preview" aria-label="Anki preview">
           <div class="front"></div>
           <div class="back"></div>
         </div>
+
         <div class="clip-actions">
-          <button class="process" type="button">Process</button>
+          <button class="process" type="button">Reprocess with Claude</button>
           <button class="save" type="button">Save edits</button>
-          <button class="approve" type="button">Approve</button>
+          <button class="approve" type="button">Approve card</button>
         </div>
         <p class="error"></p>
       </article>
