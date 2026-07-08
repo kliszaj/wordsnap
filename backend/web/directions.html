@@ -1,0 +1,767 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>WordSnap UI directions</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --paper: #e9e8e4;
+        --ink: #111111;
+        --soft-ink: #55575d;
+        --screen: #090909;
+        --screen-2: #151516;
+        --line: #c9c7c0;
+        --red: #ff3b2f;
+        --orange: #ff5a19;
+        --green: #77d89c;
+        --blue: #9fb8ff;
+        --case: #f2f1ed;
+        --case-dark: #d8d6d0;
+        font-family: "Geist", "Satoshi", "Segoe UI", system-ui, sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100dvh;
+        background:
+          radial-gradient(circle at 16% 12%, rgba(255, 90, 25, 0.12), transparent 26rem),
+          linear-gradient(135deg, #f4f3ef, #deddd8);
+        color: var(--ink);
+      }
+
+      .page {
+        width: min(1500px, calc(100% - 44px));
+        margin: 0 auto;
+        padding: 44px 0 72px;
+      }
+
+      .intro {
+        display: grid;
+        grid-template-columns: 1.2fr 0.8fr;
+        gap: 32px;
+        align-items: end;
+        margin-bottom: 38px;
+      }
+
+      .kicker,
+      .mono {
+        font-family: "JetBrains Mono", "Cascadia Mono", monospace;
+      }
+
+      .kicker {
+        margin: 0 0 14px;
+        color: var(--orange);
+        font-size: 13px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin-top: 0;
+      }
+
+      h1 {
+        max-width: 820px;
+        margin-bottom: 16px;
+        font-size: clamp(48px, 7vw, 104px);
+        letter-spacing: -0.06em;
+        line-height: 0.9;
+      }
+
+      .intro p {
+        max-width: 640px;
+        color: var(--soft-ink);
+        font-size: 18px;
+        line-height: 1.55;
+      }
+
+      .rules {
+        border-left: 2px solid var(--orange);
+        padding-left: 18px;
+        color: var(--soft-ink);
+        line-height: 1.6;
+      }
+
+      .directions {
+        display: grid;
+        gap: 28px;
+      }
+
+      .direction {
+        display: grid;
+        grid-template-columns: 420px minmax(0, 1fr);
+        gap: 26px;
+        min-height: 460px;
+        padding: 24px;
+        border: 1px solid rgba(0, 0, 0, 0.08);
+        border-radius: 34px;
+        background: rgba(255, 255, 255, 0.54);
+        box-shadow: 0 26px 80px rgba(20, 20, 20, 0.10);
+      }
+
+      .direction:nth-child(even) {
+        grid-template-columns: minmax(0, 1fr) 420px;
+      }
+
+      .direction:nth-child(even) .device {
+        order: 2;
+      }
+
+      .device {
+        position: relative;
+        overflow: hidden;
+        min-height: 420px;
+        border-radius: 32px;
+        background: var(--case);
+        box-shadow:
+          inset 0 0 0 2px rgba(255, 255, 255, 0.7),
+          inset 0 -16px 24px rgba(0, 0, 0, 0.08),
+          0 24px 48px rgba(0, 0, 0, 0.16);
+      }
+
+      .device.black {
+        background: #1d1f22;
+        box-shadow:
+          inset 0 0 0 1px rgba(255, 255, 255, 0.05),
+          0 28px 60px rgba(0, 0, 0, 0.2);
+      }
+
+      .screen {
+        position: absolute;
+        inset: 22px 22px auto;
+        height: 265px;
+        overflow: hidden;
+        border: 2px solid #1b1b1b;
+        border-radius: 20px;
+        background:
+          repeating-linear-gradient(0deg, rgba(255, 255, 255, 0.035) 0 1px, transparent 1px 4px),
+          var(--screen);
+        color: #f4f1ec;
+      }
+
+      .screen.round {
+        border-radius: 44px;
+      }
+
+      .screen .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 22px 24px 0;
+        color: #a7a5a0;
+        font-size: 13px;
+      }
+
+      .status-dot {
+        display: inline-block;
+        width: 7px;
+        height: 7px;
+        margin-right: 7px;
+        border-radius: 50%;
+        background: var(--red);
+      }
+
+      .timer {
+        position: absolute;
+        left: 28px;
+        bottom: 24px;
+        color: #efefef;
+        font-family: "JetBrains Mono", "Cascadia Mono", monospace;
+        font-size: 56px;
+        font-weight: 300;
+        letter-spacing: -0.09em;
+      }
+
+      .wave {
+        position: absolute;
+        left: 28px;
+        right: 28px;
+        top: 122px;
+        display: flex;
+        align-items: center;
+        height: 66px;
+        gap: 5px;
+      }
+
+      .bar {
+        width: 3px;
+        min-height: 8px;
+        background: #e9e9e4;
+      }
+
+      .bar:nth-child(3n) {
+        height: 62px;
+      }
+
+      .bar:nth-child(4n) {
+        height: 24px;
+      }
+
+      .bar:nth-child(5n) {
+        height: 44px;
+      }
+
+      .playhead {
+        position: absolute;
+        left: 62%;
+        top: 92px;
+        width: 2px;
+        height: 108px;
+        background: var(--red);
+      }
+
+      .playhead::before {
+        content: "";
+        position: absolute;
+        top: -6px;
+        left: -5px;
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: var(--red);
+      }
+
+      .controls {
+        position: absolute;
+        left: 22px;
+        right: 22px;
+        bottom: 22px;
+        display: grid;
+        grid-template-columns: 1fr 1fr 0.9fr;
+        gap: 0;
+        height: 116px;
+        overflow: hidden;
+        border: 2px solid #202020;
+        border-radius: 18px;
+      }
+
+      .pad {
+        display: grid;
+        place-items: center;
+        border-right: 2px solid #202020;
+        background: #deddda;
+      }
+
+      .pad:last-child {
+        border-right: 0;
+      }
+
+      .button-disc {
+        width: 58px;
+        height: 58px;
+        border-radius: 50%;
+        background: radial-gradient(circle, #f2f1ef, #cfcdc8);
+        box-shadow: inset 0 5px 14px rgba(255, 255, 255, 0.7), 0 6px 18px rgba(0, 0, 0, 0.12);
+      }
+
+      .button-disc.red::after {
+        content: "";
+        display: block;
+        width: 18px;
+        height: 18px;
+        margin: 20px auto;
+        border-radius: 50%;
+        background: var(--red);
+      }
+
+      .content {
+        display: grid;
+        align-content: start;
+        gap: 20px;
+        padding: 8px 4px;
+      }
+
+      .content h2 {
+        font-size: 34px;
+        letter-spacing: -0.04em;
+        line-height: 1;
+      }
+
+      .content p {
+        max-width: 720px;
+        color: var(--soft-ink);
+        line-height: 1.55;
+      }
+
+      .pipeline {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .stage {
+        display: grid;
+        grid-template-columns: 116px minmax(0, 1fr) auto;
+        gap: 14px;
+        align-items: center;
+        padding: 14px;
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: rgba(255, 255, 255, 0.55);
+      }
+
+      .stage strong {
+        font-family: "JetBrains Mono", "Cascadia Mono", monospace;
+        font-size: 12px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+      }
+
+      .stage label {
+        display: grid;
+        gap: 6px;
+        color: var(--soft-ink);
+        font-size: 12px;
+      }
+
+      .stage input,
+      .stage textarea {
+        width: 100%;
+        border: 1px solid #bbb8ae;
+        border-radius: 10px;
+        background: #f7f5ef;
+        color: var(--ink);
+        font: inherit;
+        padding: 9px 10px;
+        resize: vertical;
+      }
+
+      .stage button,
+      .pill {
+        min-height: 36px;
+        border: 0;
+        border-radius: 999px;
+        background: var(--ink);
+        color: #f8f5ee;
+        font: inherit;
+        padding: 0 14px;
+      }
+
+      .stage.orange button,
+      .pill.orange {
+        background: var(--orange);
+        color: #140a03;
+      }
+
+      .stage.green button,
+      .pill.green {
+        background: var(--green);
+        color: #07120b;
+      }
+
+      .cassette {
+        position: absolute;
+        left: 28px;
+        right: 28px;
+        bottom: 26px;
+        height: 120px;
+        border: 2px solid #202020;
+        border-radius: 16px;
+        background:
+          radial-gradient(circle at 28% 50%, transparent 0 28px, #1c1c1c 29px 31px, transparent 32px),
+          radial-gradient(circle at 72% 50%, transparent 0 28px, #1c1c1c 29px 31px, transparent 32px),
+          #e0ded8;
+      }
+
+      .cassette::after {
+        content: "";
+        position: absolute;
+        left: 22%;
+        right: 22%;
+        top: 50%;
+        height: 8px;
+        border-radius: 999px;
+        background: #222;
+      }
+
+      .mini-screen {
+        position: absolute;
+        left: 24px;
+        right: 24px;
+        top: 24px;
+        height: 176px;
+        border-radius: 22px;
+        background:
+          repeating-linear-gradient(90deg, rgba(255, 255, 255, 0.08) 0 1px, transparent 1px 13px),
+          var(--screen);
+        color: white;
+        padding: 24px;
+      }
+
+      .big-clock {
+        margin-top: 18px;
+        font-family: "JetBrains Mono", "Cascadia Mono", monospace;
+        font-size: 66px;
+        letter-spacing: -0.1em;
+        font-weight: 300;
+      }
+
+      .orange-strip {
+        position: absolute;
+        left: 24px;
+        right: 24px;
+        top: 206px;
+        height: 64px;
+        border-radius: 16px;
+        background: var(--orange);
+      }
+
+      .orange-strip::before {
+        content: "";
+        position: absolute;
+        left: 24px;
+        right: 24px;
+        top: 31px;
+        height: 2px;
+        background: #16110d;
+        box-shadow:
+          8px 0 0 #16110d,
+          16px 0 0 #16110d,
+          24px 0 0 #16110d,
+          32px 0 0 #16110d;
+      }
+
+      .deck-screen {
+        position: absolute;
+        inset: 22px 22px 132px;
+        border-radius: 16px;
+        background: var(--screen);
+        color: white;
+        padding: 18px;
+      }
+
+      .deck-grid {
+        position: absolute;
+        left: 22px;
+        right: 22px;
+        bottom: 22px;
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 10px;
+        height: 90px;
+      }
+
+      .deck-key {
+        display: grid;
+        place-items: center;
+        border: 2px solid #222;
+        border-radius: 14px;
+        background: #e5e3dc;
+        font-family: "JetBrains Mono", "Cascadia Mono", monospace;
+      }
+
+      .black .deck-key {
+        border-color: #3b3d40;
+        background: #26282c;
+        color: #d9d7d2;
+      }
+
+      .black .screen,
+      .black .deck-screen,
+      .black .mini-screen {
+        border-color: #303236;
+      }
+
+      .rail {
+        height: 4px;
+        margin: 18px 0 10px;
+        background: linear-gradient(90deg, var(--orange) 0 62%, #57534c 62%);
+      }
+
+      .ticks {
+        display: grid;
+        grid-template-columns: repeat(32, 1fr);
+        gap: 4px;
+      }
+
+      .ticks span {
+        height: 9px;
+        border-left: 1px solid currentColor;
+        color: #9e9b91;
+      }
+
+      .send-card {
+        display: grid;
+        grid-template-columns: 120px 1fr;
+        gap: 1px;
+        overflow: hidden;
+        border: 1px solid var(--line);
+        border-radius: 16px;
+        background: var(--line);
+      }
+
+      .send-card div {
+        min-height: 74px;
+        padding: 16px;
+        background: #f7f5ef;
+      }
+
+      @media (max-width: 980px) {
+        .intro,
+        .direction,
+        .direction:nth-child(even) {
+          grid-template-columns: 1fr;
+        }
+
+        .direction:nth-child(even) .device {
+          order: 0;
+        }
+
+        .stage {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="intro">
+        <div>
+          <p class="kicker">WordSnap visual directions</p>
+          <h1>Simple cassette futures.</h1>
+          <p>
+            Five possible directions for the Hoth review UI. All keep the same product logic:
+            play the uploaded clip, fix transcription before Claude, review the Anki card, then send
+            approved cards to your Anki library.
+          </p>
+        </div>
+        <div class="rules mono">
+          Pipeline model<br />
+          01 Transcription correction<br />
+          02 Translation and card creation<br />
+          03 Send to Anki library
+        </div>
+      </section>
+
+      <section class="directions">
+        <article class="direction">
+          <div class="device">
+            <div class="screen">
+              <div class="topbar mono"><span>04:35 PM</span><span><span class="status-dot"></span>NEW RECORDING</span></div>
+              <div class="wave">
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+              </div>
+              <div class="playhead"></div>
+              <div class="timer">00:12:10</div>
+            </div>
+            <div class="controls">
+              <div class="pad"><span class="button-disc red"></span></div>
+              <div class="pad"><span class="button-disc"></span></div>
+              <div class="pad mono">SYNC</div>
+            </div>
+          </div>
+          <div class="content">
+            <p class="kicker">Direction 01</p>
+            <h2>Portable recorder dashboard</h2>
+            <p>
+              Closest to your cassette reference: physical device frame, waveform first, controls as
+              chunky hardware keys. Best if the website should feel like operating the recorder remotely.
+            </p>
+            <div class="pipeline">
+              <div class="stage">
+                <strong>01 Tape</strong>
+                <label>Transcript correction <input value="En hårta" /></label>
+                <button>Save transcript</button>
+              </div>
+              <div class="stage orange">
+                <strong>02 Card</strong>
+                <label>Claude input <input value="skjorta" /></label>
+                <button>Create card</button>
+              </div>
+              <div class="stage green">
+                <strong>03 Anki</strong>
+                <label>Preview <input value="SWE: plagg för överkroppen. ENG: shirt." /></label>
+                <button>Send</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="direction">
+          <div class="device">
+            <div class="mini-screen">
+              <div class="mono">Tuesday 17</div>
+              <div class="big-clock">08:26</div>
+              <div class="mono" style="margin-top: 22px">12 clips waiting</div>
+            </div>
+            <div class="orange-strip"></div>
+            <div class="cassette"></div>
+          </div>
+          <div class="content">
+            <p class="kicker">Direction 02</p>
+            <h2>Clock cassette</h2>
+            <p>
+              Minimal and almost appliance-like. The UI becomes a quiet queue: time, pending clips,
+              one orange active rail. Good if you want less dashboard and more ritual.
+            </p>
+            <div class="pipeline">
+              <div class="stage">
+                <strong>01 Listen</strong>
+                <label>Playback <input value="rec_014.wav 00:10" /></label>
+                <button>Play</button>
+              </div>
+              <div class="stage orange">
+                <strong>02 Fix</strong>
+                <label>Corrected transcript <input value="Jag hörde ordet rimligt på jobbet" /></label>
+                <button>Reprocess</button>
+              </div>
+              <div class="stage green">
+                <strong>03 Library</strong>
+                <label>Anki front <input value="rimlig" /></label>
+                <button>Approve</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="direction">
+          <div class="device black">
+            <div class="deck-screen">
+              <div class="mono">02:52:42 Remaining <span style="color: var(--red)">REC</span></div>
+              <div class="big-clock" style="font-size: 56px">00:08:42</div>
+              <div class="rail"></div>
+              <div class="ticks">
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+                <span></span><span></span><span></span><span></span><span></span><span></span><span></span><span></span>
+              </div>
+              <div class="mono" style="position: absolute; bottom: 18px">101023_001.wav</div>
+            </div>
+            <div class="deck-grid">
+              <div class="deck-key">REC</div>
+              <div class="deck-key">PLAY</div>
+              <div class="deck-key">SEND</div>
+            </div>
+          </div>
+          <div class="content">
+            <p class="kicker">Direction 03</p>
+            <h2>Black field recorder</h2>
+            <p>
+              Darker, more technical, with thin mono numerals and red tape rails. Best if the web app
+              should share the device’s “recording equipment” personality.
+            </p>
+            <div class="pipeline">
+              <div class="stage">
+                <strong>01 Raw</strong>
+                <label>Transcription <textarea rows="2">Förmågorligen.</textarea></label>
+                <button>Update</button>
+              </div>
+              <div class="stage orange">
+                <strong>02 Claude</strong>
+                <label>Target word <input value="förmodligen" /></label>
+                <button>Build</button>
+              </div>
+              <div class="stage green">
+                <strong>03 Ship</strong>
+                <label>Tags <input value="svenska wordclip week::2026-W28" /></label>
+                <button>Queue</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="direction">
+          <div class="device">
+            <div class="screen round">
+              <div class="topbar mono"><span>WORDSNAP</span><span>12 CLIPS</span></div>
+              <div class="timer" style="font-size: 42px">TRANSLATE</div>
+              <div class="wave" style="top: 96px">
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+                <span class="bar"></span><span class="bar"></span><span class="bar"></span><span class="bar"></span>
+              </div>
+            </div>
+            <div class="deck-grid" style="grid-template-columns: 1fr 1fr">
+              <div class="deck-key">TRANSCRIBE</div>
+              <div class="deck-key">ANKI</div>
+            </div>
+          </div>
+          <div class="content">
+            <p class="kicker">Direction 04</p>
+            <h2>Three-station pipeline</h2>
+            <p>
+              Most product-clear. Each clip physically moves through three stations: transcription,
+              card creation, library. Good if correction is the main job and you want fewer visual tricks.
+            </p>
+            <div class="pipeline">
+              <div class="stage">
+                <strong>Station 01</strong>
+                <label>Clip and transcript <input value="Sjögård" /></label>
+                <button>Correct</button>
+              </div>
+              <div class="stage orange">
+                <strong>Station 02</strong>
+                <label>SWE / ENG <input value="område vid en kust med många öar / archipelago" /></label>
+                <button>Regenerate</button>
+              </div>
+              <div class="stage green">
+                <strong>Station 03</strong>
+                <label>Library state <input value="Approved, not sent" /></label>
+                <button>Send to Anki</button>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="direction">
+          <div class="device black">
+            <div class="screen">
+              <div class="topbar mono"><span>INBOX</span><span>APPROVED 08</span></div>
+              <div style="position: absolute; inset: 70px 24px 24px; display: grid; gap: 12px">
+                <div class="send-card">
+                  <div class="mono">rimlig</div>
+                  <div>SWE: förnuftig eller skälig.<br />ENG: reasonable.</div>
+                </div>
+                <div class="send-card">
+                  <div class="mono">lagom</div>
+                  <div>SWE: varken för mycket eller för lite.<br />ENG: just right.</div>
+                </div>
+              </div>
+            </div>
+            <div class="controls" style="grid-template-columns: 1fr">
+              <div class="pad mono">SEND APPROVED TO LIBRARY</div>
+            </div>
+          </div>
+          <div class="content">
+            <p class="kicker">Direction 05</p>
+            <h2>Library queue</h2>
+            <p>
+              More Anki-oriented. The main object is the approved card queue, with raw audio one click
+              away. Best if you care most about the final collection and want a calm review desk.
+            </p>
+            <div class="pipeline">
+              <div class="stage">
+                <strong>01 Audio</strong>
+                <label>Clip <input value="rec_014.wav" /></label>
+                <button>Play</button>
+              </div>
+              <div class="stage orange">
+                <strong>02 Review</strong>
+                <label>Back <input value="SWE: förnuftig eller skälig. ENG: reasonable." /></label>
+                <button>Approve</button>
+              </div>
+              <div class="stage green">
+                <strong>03 Library</strong>
+                <label>Destination <input value="Anki / Field Captures" /></label>
+                <button>Send batch</button>
+              </div>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+  </body>
+</html>
