@@ -20,6 +20,10 @@ function clipNumber(clip, index) {
   return String(index + 1).padStart(3, "0");
 }
 
+function clipFront(clip) {
+  return clip.card_front || clip.corrected_word || clip.original_name;
+}
+
 function ankiBack(clip) {
   if (clip.anki?.back) return clip.anki.back.replaceAll("<br>", "\n");
   if (clip.swedish_definition || clip.english_definition) {
@@ -50,6 +54,7 @@ async function request(path, options = {}) {
     const text = await response.text();
     throw new Error(text || response.statusText);
   }
+  if (response.status === 204) return {};
   return response.json();
 }
 
@@ -73,16 +78,23 @@ function renderQueue() {
 
   clips.forEach((clip, index) => {
     const node = queueTemplate.content.firstElementChild.cloneNode(true);
-    node.classList.toggle("active", clip.id === selectedClipId);
+    const item = node.querySelector(".queue-item");
+    item.classList.toggle("active", clip.id === selectedClipId);
     node.querySelector(".queue-number").textContent = clipNumber(clip, index);
-    node.querySelector(".queue-title").textContent = clip.corrected_word || clip.original_name;
+    node.querySelector(".queue-title").textContent = clipFront(clip);
     node.querySelector(".queue-meta").textContent = clip.iso_week || "unsorted";
     const status = node.querySelector(".status");
     status.className = statusClass(clip.status);
     status.textContent = clip.status;
-    node.addEventListener("click", () => {
+    item.addEventListener("click", () => {
       selectedClipId = clip.id;
       render();
+    });
+    node.querySelector(".queue-delete").addEventListener("click", async () => {
+      if (!confirm(`Delete ${clip.original_name}?`)) return;
+      await request(`/api/clips/${clip.id}`, { method: "DELETE" });
+      if (selectedClipId === clip.id) selectedClipId = null;
+      await loadClips();
     });
     queueList.append(node);
   });
@@ -100,7 +112,7 @@ function renderDetail() {
   }
 
   const node = detailTemplate.content.firstElementChild.cloneNode(true);
-  node.querySelector(".clip-title").textContent = clip.corrected_word || clip.original_name;
+  node.querySelector(".clip-title").textContent = clipFront(clip);
   node.querySelector(".clip-meta").textContent = `${clip.original_name} · ${clip.iso_week || "unsorted"}`;
   const status = node.querySelector(".status");
   status.className = statusClass(clip.status);
@@ -108,16 +120,16 @@ function renderDetail() {
   node.querySelector(".audio").src = `/api/clips/${clip.id}/audio`;
 
   const transcript = node.querySelector(".transcript");
-  const correctedWord = node.querySelector(".corrected-word");
+  const cardFront = node.querySelector(".card-front");
   const swedish = node.querySelector(".swedish-definition");
   const english = node.querySelector(".english-definition");
 
   transcript.value = clip.transcript || "";
-  correctedWord.value = clip.corrected_word || "";
+  cardFront.value = clip.card_front || clip.corrected_word || "";
   swedish.value = clip.swedish_definition || "";
   english.value = clip.english_definition || "";
 
-  node.querySelector(".front").textContent = clip.anki?.front || clip.corrected_word || "Front";
+  node.querySelector(".front").textContent = clip.anki?.front || clip.card_front || clip.corrected_word || "Front";
   node.querySelector(".back").textContent = ankiBack(clip);
 
   node.querySelector(".process").addEventListener("click", async () => {
@@ -125,27 +137,23 @@ function renderDetail() {
       method: "POST",
       body: JSON.stringify({
         transcript: transcript.value,
-        corrected_word: correctedWord.value,
+        card_front: cardFront.value,
         iso_week: clip.iso_week,
       }),
     });
     await loadClips();
   });
 
-  node.querySelector(".save").addEventListener("click", async () => {
+  node.querySelector(".save-anki").addEventListener("click", async () => {
     await request(`/api/clips/${clip.id}`, {
       method: "PATCH",
       body: JSON.stringify({
         transcript: transcript.value,
-        corrected_word: correctedWord.value,
+        card_front: cardFront.value,
         swedish_definition: swedish.value,
         english_definition: english.value,
       }),
     });
-    await loadClips();
-  });
-
-  node.querySelector(".approve").addEventListener("click", async () => {
     await request(`/api/clips/${clip.id}/approve`, { method: "POST", body: JSON.stringify({}) });
     await loadClips();
   });

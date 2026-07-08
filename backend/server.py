@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -23,7 +23,7 @@ from compare import (
 )
 from enrich_claude import enrich_with_claude
 from enrich_openai import transcribe
-from store import DATA_DIR, add_clip, find_clip, load_clips, update_clip, utc_now
+from store import DATA_DIR, add_clip, delete_clip, find_clip, load_clips, update_clip, utc_now
 
 import settings
 
@@ -39,6 +39,8 @@ settings.apply_to_env()
 
 class ClipPatch(BaseModel):
     transcript: str | None = None
+    card_type: str | None = None
+    card_front: str | None = None
     corrected_word: str | None = None
     swedish_definition: str | None = None
     english_definition: str | None = None
@@ -47,6 +49,7 @@ class ClipPatch(BaseModel):
 
 class ProcessRequest(BaseModel):
     transcript: str | None = None
+    card_front: str | None = None
     corrected_word: str | None = None
     iso_week: str | None = None
     capture_timestamp: str | None = None
@@ -155,9 +158,10 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
                 raise HTTPException(status_code=400, detail="OpenAI API key not configured. Add it in Settings.")
             transcript = transcribe(str(wav_path), model=os.getenv("WHISPER_MODEL", DEFAULT_WHISPER_MODEL))
 
+        requested_front = request.card_front or request.corrected_word
         enrichment_input = transcript
-        if request.corrected_word:
-            enrichment_input = f"{transcript}\nTarget word correction from reviewer: {request.corrected_word}"
+        if requested_front:
+            enrichment_input = f"{transcript}\nTarget Swedish item correction from reviewer: {requested_front}"
 
         card = enrich_with_claude(enrichment_input, model=os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL))
         if card is None:
@@ -188,11 +192,12 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
 def patch_clip(clip_id: str, patch: ClipPatch) -> dict[str, Any]:
     changes = {k: v for k, v in patch.model_dump().items() if v is not None}
     clip = find_clip(clip_id)
-    if {"corrected_word", "swedish_definition", "english_definition"} & changes.keys():
+    if {"card_front", "corrected_word", "swedish_definition", "english_definition"} & changes.keys():
         merged = {**clip, **changes}
-        if merged.get("corrected_word") and merged.get("swedish_definition") and merged.get("english_definition"):
+        front = merged.get("card_front") or merged.get("corrected_word")
+        if front and merged.get("swedish_definition") and merged.get("english_definition"):
             merged_card = {
-                "front": merged["corrected_word"],
+                "front": front,
                 "back": f"SWE: {merged['swedish_definition']}<br>ENG: {merged['english_definition']}",
                 "tags": f"svenska wordclip week::{merged.get('iso_week', 'unsorted')}",
             }
@@ -204,6 +209,12 @@ def patch_clip(clip_id: str, patch: ClipPatch) -> dict[str, Any]:
 @app.post("/api/clips/{clip_id}/approve")
 def approve_clip(clip_id: str) -> dict[str, Any]:
     return update_clip(clip_id, {"status": "approved"})
+
+
+@app.delete("/api/clips/{clip_id}", status_code=204)
+def remove_clip(clip_id: str) -> Response:
+    delete_clip(clip_id)
+    return Response(status_code=204)
 
 
 @app.get("/api/clips/{clip_id}/audio")

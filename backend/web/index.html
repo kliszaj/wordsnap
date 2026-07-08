@@ -34,7 +34,7 @@
         <div class="toolbar-actions">
           <button type="button" class="ghost-button" id="settings-open">Settings</button>
           <label class="file-button">
-            Upload WAV
+            Upload
             <input id="file-input" type="file" accept="audio/wav,.wav" multiple />
           </label>
           <a class="ghost-button strong" href="/api/export/anki.csv">Export CSV</a>
@@ -105,14 +105,17 @@
     </dialog>
 
     <template id="queue-template">
-      <button class="queue-item" type="button">
-        <span class="queue-number"></span>
-        <span>
-          <strong class="queue-title"></strong>
-          <small class="queue-meta"></small>
-        </span>
-        <span class="status"></span>
-      </button>
+      <div class="queue-row">
+        <button class="queue-item" type="button">
+          <span class="queue-number"></span>
+          <span>
+            <strong class="queue-title"></strong>
+            <small class="queue-meta"></small>
+          </span>
+          <span class="status"></span>
+        </button>
+        <button class="queue-delete" type="button" aria-label="Delete clip">Delete</button>
+      </div>
     </template>
 
     <template id="detail-template">
@@ -143,10 +146,10 @@
               <textarea class="transcript" rows="7"></textarea>
             </label>
             <label>
-              Corrected word
-              <input class="corrected-word" />
+              Swedish item
+              <input class="card-front" />
             </label>
-            <button class="save" type="button">Save transcript</button>
+            <button class="process" type="button">Transcribe</button>
           </section>
 
           <section class="tape-card">
@@ -161,10 +164,9 @@
               <textarea class="swedish-definition" rows="7"></textarea>
             </label>
             <label>
-              English word
+              English meaning
               <input class="english-definition" />
             </label>
-            <button class="process" type="button">Reprocess with Claude</button>
           </section>
 
           <section class="tape-card">
@@ -184,7 +186,7 @@
                 <div class="back"></div>
               </div>
             </div>
-            <button class="approve" type="button">Approve card</button>
+            <button class="save-anki" type="button">Save to Anki</button>
           </section>
         </div>
         <p class="error"></p>

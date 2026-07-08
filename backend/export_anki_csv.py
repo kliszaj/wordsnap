@@ -52,7 +52,7 @@ def main() -> None:
             note = record.get("anki") or {}
             writer.writerow(
                 {
-                    "Front": note.get("front", record.get("corrected_word", "")),
+                    "Front": note.get("front", record.get("card_front") or record.get("corrected_word", "")),
                     "Back": note.get("back", ""),
                     "Tags": note.get("tags", ""),
                 }

@@ -16,6 +16,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <dirent.h>
+#include <sys/stat.h>
+#include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
@@ -61,6 +64,7 @@ static const char *TAG = "wordclip";
 #define LCD_H_RES   240
 #define LCD_V_RES   284
 #define MOUNT_POINT "/sdcard"
+#define CLIPS_DIR   MOUNT_POINT "/clips"   /* recordings live here; root keeps only wifi.txt */
 
 /* ---- audio (ES7210 via I2S TDM) ---- */
 #define I2C_PORT        I2C_NUM_0
@@ -459,8 +463,8 @@ static esp_err_t audio_init(void)
 static int next_index(void)
 {
     for (int i = 1; i < 1000; i++) {
-        char path[64];
-        snprintf(path, sizeof(path), MOUNT_POINT "/rec_%03d.wav", i);
+        char path[80];
+        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
         FILE *f = fopen(path, "r");
         if (!f) return i;
         fclose(f);
@@ -475,11 +479,40 @@ static int pending_clip_count(void)
     return next - 1;
 }
 
+/* Ensure /sdcard/clips exists, and move any legacy rec_*.wav out of the card root into it. */
+static void ensure_clips_folder(void)
+{
+    mkdir(CLIPS_DIR, 0777);
+
+    DIR *d = opendir(MOUNT_POINT);
+    if (!d) return;
+    static char names[64][32];
+    int count = 0;
+    struct dirent *e;
+    while (count < 64 && (e = readdir(d)) != NULL) {
+        size_t n = strlen(e->d_name);
+        if (n > 4 && strncmp(e->d_name, "rec_", 4) == 0 &&
+            strcasecmp(e->d_name + n - 4, ".wav") == 0) {
+            strlcpy(names[count++], e->d_name, sizeof(names[0]));
+        }
+    }
+    closedir(d);
+
+    int moved = 0;
+    for (int i = 0; i < count; i++) {
+        char src[96], dst[96];
+        snprintf(src, sizeof(src), MOUNT_POINT "/%s", names[i]);
+        snprintf(dst, sizeof(dst), CLIPS_DIR "/%s", names[i]);
+        if (rename(src, dst) == 0) moved++;
+    }
+    if (moved) ESP_LOGI(TAG, "moved %d clip(s) from root into %s", moved, CLIPS_DIR);
+}
+
 /* Record audio to a WAV until stop is requested or the safety cap is reached. */
 static void record_wav(int index)
 {
-    char path[64];
-    snprintf(path, sizeof(path), MOUNT_POINT "/rec_%03d.wav", index);
+    char path[80];
+    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
 
     const uint32_t byte_rate = SAMPLE_RATE * CHAN_NUM * 16 / 8;
     const uint32_t max_wav_size  = byte_rate * MAX_RECORD_SECONDS;
@@ -651,29 +684,129 @@ static void wifi_down(void)
     ESP_LOGI(TAG, "WiFi stopped");
 }
 
+#define UP_BOUNDARY "----wordclipBoundary7MA4YWxkTrZu0gW"
+
+/* POST one WAV to <server>/api/upload as multipart/form-data (field "file").
+ * Returns the HTTP status code, or -1 on a transport error. */
+static int http_upload_file(const char *server, const char *fullpath, const char *filename)
+{
+    FILE *f = fopen(fullpath, "rb");
+    if (!f) { ESP_LOGE(TAG, "open %s failed", fullpath); return -1; }
+    fseek(f, 0, SEEK_END);
+    long fsize = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    char preamble[224];
+    int plen = snprintf(preamble, sizeof(preamble),
+        "--" UP_BOUNDARY "\r\n"
+        "Content-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+        "Content-Type: audio/wav\r\n\r\n", filename);
+    static const char epilogue[] = "\r\n--" UP_BOUNDARY "--\r\n";
+    int elen = (int)(sizeof(epilogue) - 1);
+    int content_length = plen + (int)fsize + elen;
+
+    char url[192];
+    snprintf(url, sizeof(url), "%s/api/upload", server);
+
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 20000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    esp_http_client_set_header(client, "Content-Type",
+                               "multipart/form-data; boundary=" UP_BOUNDARY);
+
+    int status = -1;
+    if (esp_http_client_open(client, content_length) != ESP_OK) {
+        ESP_LOGE(TAG, "http open failed for %s", url);
+        goto done;
+    }
+    if (esp_http_client_write(client, preamble, plen) < 0) goto done;
+
+    static uint8_t up_buf[2048];
+    size_t n;
+    while ((n = fread(up_buf, 1, sizeof(up_buf), f)) > 0) {
+        if (esp_http_client_write(client, (char *)up_buf, n) < 0) { ESP_LOGE(TAG, "body write failed"); goto done; }
+    }
+    if (esp_http_client_write(client, epilogue, elen) < 0) goto done;
+
+    esp_http_client_fetch_headers(client);
+    status = esp_http_client_get_status_code(client);
+    ESP_LOGI(TAG, "upload %s (%ld bytes) -> HTTP %d", filename, fsize, status);
+
+done:
+    fclose(f);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    return status;
+}
+
+/* Blue screen with a white progress bar filled to done/total. */
+static void upload_progress(int done, int total)
+{
+    lcd_fill(C_BLUE);
+    const int margin = 20;
+    const int bar_w = LCD_H_RES - 2 * margin;
+    const int bar_y = LCD_V_RES / 2 - 14;
+    const int bar_h = 28;
+    lcd_rect(margin, bar_y, margin + bar_w, bar_y + bar_h, C_CHARCOAL);   /* track */
+    int fill_w = (total > 0) ? (bar_w * done / total) : 0;
+    if (fill_w > 0) lcd_rect(margin, bar_y, margin + fill_w, bar_y + bar_h, C_WHITE);
+}
+
 static void upload_pending_clips(void)
 {
     /* WiFi and I2S are used in separate modes (per PRD): upload only happens while idle. */
-    lcd_fill(C_BLUE);   /* on-screen "connecting…" feedback */
+    lcd_fill(C_BLUE);   /* connecting… */
 
     wifi_conf_t conf;
     if (!read_wifi_conf(&conf)) {
         ESP_LOGE(TAG, "Upload aborted: no usable /sdcard/wifi.txt");
-        lcd_fill(C_RED);
-        vTaskDelay(pdMS_TO_TICKS(900));
-        return;
+        lcd_fill(C_RED); vTaskDelay(pdMS_TO_TICKS(900)); return;
     }
     ESP_LOGI(TAG, "Upload: connecting to ssid='%s' (server=%s)", conf.ssid, conf.server);
     if (wifi_up(&conf) != ESP_OK) {
-        lcd_fill(C_RED);        /* connect failed/timeout */
-        vTaskDelay(pdMS_TO_TICKS(900));
-        return;
+        lcd_fill(C_RED); vTaskDelay(pdMS_TO_TICKS(900)); return;
     }
-    /* Stage 1: connectivity proven. Stage 2/3 will POST rec_*.wav to <server>/api/upload here. */
-    ESP_LOGI(TAG, "WiFi up — %d clip(s) pending (HTTP upload lands next stage)", pending_clip_count());
-    lcd_fill(C_GREEN);          /* connected OK */
-    vTaskDelay(pdMS_TO_TICKS(900));
+
+    /* Count clips to sync so we can show progress. */
+    int total = 0;
+    for (int i = 1; i < 1000; i++) {
+        char path[80];
+        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
+        FILE *p = fopen(path, "r");
+        if (p) { fclose(p); total++; }
+    }
+    ESP_LOGI(TAG, "Syncing %d clip(s) to %s", total, conf.server);
+    upload_progress(0, total);
+
+    /* Stage 3: upload every clip; delete each from the card only on a 2xx ACK. */
+    int uploaded = 0, failed = 0, processed = 0;
+    for (int i = 1; i < 1000 && processed < total; i++) {
+        char path[80], name[24];
+        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
+        snprintf(name, sizeof(name), "rec_%03d.wav", i);
+        FILE *probe = fopen(path, "r");
+        if (!probe) continue;
+        fclose(probe);
+
+        int status = http_upload_file(conf.server, path, name);
+        if (status >= 200 && status < 300) {
+            remove(path);
+            uploaded++;
+        } else {
+            failed++;
+            ESP_LOGE(TAG, "upload %s failed (HTTP %d), keeping on card", name, status);
+        }
+        processed++;
+        upload_progress(processed, total);
+    }
+
     wifi_down();
+    lcd_fill(failed == 0 ? C_GREEN : C_RED);   /* green only on a fully clean sync */
+    vTaskDelay(pdMS_TO_TICKS(1200));
+    ESP_LOGI(TAG, "Sync finished: %d ok, %d failed", uploaded, failed);
 }
 
 void app_main(void)
@@ -693,6 +826,7 @@ void app_main(void)
     vTaskDelay(pdMS_TO_TICKS(300));
 
     s_sd_ok = sd_mount();
+    if (s_sd_ok) ensure_clips_folder();
 
     esp_err_t aerr = audio_init();
     if (aerr != ESP_OK) {

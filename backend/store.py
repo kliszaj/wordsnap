@@ -57,6 +57,25 @@ def update_clip(clip_id: str, changes: dict[str, Any]) -> dict[str, Any]:
     raise KeyError(clip_id)
 
 
+def delete_clip(clip_id: str) -> bool:
+    clips = load_clips()
+    kept = []
+    deleted = None
+    for clip in clips:
+        if clip["id"] == clip_id:
+            deleted = clip
+        else:
+            kept.append(clip)
+    if deleted is None:
+        raise KeyError(clip_id)
+
+    save_clips(kept)
+    stored_path = deleted.get("stored_path")
+    if stored_path:
+        Path(stored_path).unlink(missing_ok=True)
+    return True
+
+
 def add_clip(source_path: Path, original_name: str, capture_timestamp: str | None = None) -> dict[str, Any]:
     ensure_store()
     clip_id = uuid.uuid4().hex[:12]
@@ -75,6 +94,8 @@ def add_clip(source_path: Path, original_name: str, capture_timestamp: str | Non
         "uploaded_at": now,
         "updated_at": now,
         "transcript": "",
+        "card_type": "",
+        "card_front": "",
         "corrected_word": "",
         "swedish_definition": "",
         "english_definition": "",

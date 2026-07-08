@@ -12,7 +12,7 @@ def _clean_sentence(value: str) -> str:
 
 
 def anki_front(card: Card) -> str:
-    return card.corrected_word
+    return card.card_front or card.corrected_word or card.raw_input
 
 
 def anki_back(card: Card) -> str:
