@@ -20,16 +20,21 @@ from compare import (
     derive_clip_metadata,
     load_environment,
     model_to_dict,
-    require_env,
 )
 from enrich_claude import enrich_with_claude
 from enrich_openai import transcribe
 from store import DATA_DIR, add_clip, find_clip, load_clips, update_clip, utc_now
 
+import settings
+
 
 app = FastAPI(title="WordSnap Hoth")
 WEB_DIR = Path(__file__).with_name("web")
 EXPORT_DIR = DATA_DIR / "exports"
+
+# Bootstrap credentials/config: host .env first (fallback), then appdata settings.json (wins).
+load_environment()
+settings.apply_to_env()
 
 
 class ClipPatch(BaseModel):
@@ -45,6 +50,14 @@ class ProcessRequest(BaseModel):
     corrected_word: str | None = None
     iso_week: str | None = None
     capture_timestamp: str | None = None
+
+
+class SettingsPatch(BaseModel):
+    openai_api_key: str | None = None
+    anthropic_api_key: str | None = None
+    whisper_model: str | None = None
+    claude_model: str | None = None
+    gpt_model: str | None = None
 
 
 if WEB_DIR.exists():
@@ -70,6 +83,30 @@ def device_status() -> dict[str, Any]:
         "needs_review": len([clip for clip in clips if clip["status"] in {"processed", "needs_review"}]),
         "approved": len([clip for clip in clips if clip["status"] == "approved"]),
     }
+
+
+@app.get("/api/settings")
+def get_settings() -> dict[str, Any]:
+    """Masked view of configured credentials + effective models (no raw secrets)."""
+    return settings.status()
+
+
+@app.post("/api/settings")
+def save_settings(patch: SettingsPatch) -> dict[str, Any]:
+    """Persist provided keys/models to appdata and apply them to the running process.
+
+    Only fields present in the request are changed; send "" to clear a field.
+    """
+    field_to_env = {
+        "openai_api_key": "OPENAI_API_KEY",
+        "anthropic_api_key": "ANTHROPIC_API_KEY",
+        "whisper_model": "WHISPER_MODEL",
+        "claude_model": "CLAUDE_MODEL",
+        "gpt_model": "GPT_MODEL",
+    }
+    provided = patch.model_dump(exclude_unset=True)
+    updates = {env: provided[field] for field, env in field_to_env.items() if field in provided}
+    return settings.update_settings(updates)
 
 
 @app.get("/api/clips")
@@ -101,7 +138,9 @@ async def upload_clip(
 def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[str, Any]:
     request = request or ProcessRequest()
     load_environment()
-    require_env("ANTHROPIC_API_KEY")
+    settings.apply_to_env()
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        raise HTTPException(status_code=400, detail="Anthropic API key not configured. Add it in Settings.")
 
     clip = find_clip(clip_id)
     wav_path = Path(clip["stored_path"])
@@ -112,7 +151,8 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
     try:
         transcript = request.transcript or clip.get("transcript") or ""
         if not transcript:
-            require_env("OPENAI_API_KEY")
+            if not os.getenv("OPENAI_API_KEY"):
+                raise HTTPException(status_code=400, detail="OpenAI API key not configured. Add it in Settings.")
             transcript = transcribe(str(wav_path), model=os.getenv("WHISPER_MODEL", DEFAULT_WHISPER_MODEL))
 
         enrichment_input = transcript

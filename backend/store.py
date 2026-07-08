@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import uuid
 from datetime import datetime, timezone
@@ -9,7 +10,9 @@ from pathlib import Path
 from typing import Any
 
 
-DATA_DIR = Path(__file__).with_name("data")
+# Data/appdata location. Overridable via DATA_DIR (set it to /app/data in Docker);
+# defaults to ./backend/data for local runs.
+DATA_DIR = Path(os.environ.get("DATA_DIR") or Path(__file__).with_name("data"))
 CLIP_DIR = DATA_DIR / "clips"
 DB_PATH = DATA_DIR / "clips.json"
 

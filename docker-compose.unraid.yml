@@ -1,17 +1,12 @@
 services:
   wordsnap:
-    image: ${WORDSNAP_IMAGE:-kliszaj/wordsnap:latest}
+    image: kliszaj/wordsnap:latest
     container_name: wordsnap
     restart: unless-stopped
+    user: "99:100"
+    environment:
+      DATA_DIR: /app/data
     ports:
-      - "8080:8080"
-    env_file:
-      - ./backend/.env
+      - "8090:8080"
     volumes:
-      - ${WORDSNAP_DATA_DIR:-./backend/data}:/app/data
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health').read()"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 20s
+      - /mnt/user/appdata/wordsnap/data:/app/data

@@ -3,7 +3,6 @@ const detail = document.querySelector("#clip-detail");
 const queueTemplate = document.querySelector("#queue-template");
 const detailTemplate = document.querySelector("#detail-template");
 const fileInput = document.querySelector("#file-input");
-const refreshButton = document.querySelector("#refresh-button");
 
 let clips = [];
 let selectedClipId = null;
@@ -172,8 +171,84 @@ fileInput.addEventListener("change", async () => {
   await loadClips();
 });
 
-refreshButton.addEventListener("click", loadClips);
 loadClips().catch((error) => {
   queueList.innerHTML = `<div class="empty queue-empty">Could not load clips: ${error.message}</div>`;
   detail.innerHTML = `<div class="empty">Could not load clip detail.</div>`;
 });
+
+// ---- Settings (LLM credentials, persisted to appdata) ----
+const settingsDialog = document.querySelector("#settings-dialog");
+const settingsOpen = document.querySelector("#settings-open");
+const settingsClose = document.querySelector("#settings-close");
+const settingsSave = document.querySelector("#settings-save");
+const settingsMsg = document.querySelector("#settings-msg");
+const inputAnthropic = document.querySelector("#input-anthropic");
+const inputOpenai = document.querySelector("#input-openai");
+const inputClaudeModel = document.querySelector("#input-claude-model");
+const inputWhisperModel = document.querySelector("#input-whisper-model");
+const inputGptModel = document.querySelector("#input-gpt-model");
+const statusAnthropic = document.querySelector("#status-anthropic");
+const statusOpenai = document.querySelector("#status-openai");
+
+function renderSecretStatus(el, secret) {
+  el.textContent = secret.configured ? `set · ${secret.hint}` : "not set";
+  el.className = `settings-status ${secret.configured ? "ok" : "missing"}`;
+}
+
+function renderSettings(data) {
+  renderSecretStatus(statusAnthropic, data.secrets.anthropic);
+  renderSecretStatus(statusOpenai, data.secrets.openai);
+  inputClaudeModel.placeholder = data.models.claude.value;
+  inputWhisperModel.placeholder = data.models.whisper.value;
+  inputGptModel.placeholder = data.models.gpt.value;
+}
+
+function clearSettingsInputs() {
+  for (const el of [inputAnthropic, inputOpenai, inputClaudeModel, inputWhisperModel, inputGptModel]) {
+    el.value = "";
+  }
+}
+
+async function openSettings() {
+  settingsMsg.textContent = "";
+  clearSettingsInputs();
+  try {
+    renderSettings(await request("/api/settings"));
+  } catch (error) {
+    settingsMsg.textContent = `Could not load settings: ${error.message}`;
+  }
+  if (typeof settingsDialog.showModal === "function") settingsDialog.showModal();
+  else settingsDialog.setAttribute("open", "");
+}
+
+async function saveSettings() {
+  const payload = {};
+  const fields = [
+    [inputAnthropic, "anthropic_api_key"],
+    [inputOpenai, "openai_api_key"],
+    [inputClaudeModel, "claude_model"],
+    [inputWhisperModel, "whisper_model"],
+    [inputGptModel, "gpt_model"],
+  ];
+  for (const [el, key] of fields) {
+    const value = el.value.trim();
+    if (value) payload[key] = value;
+  }
+  if (Object.keys(payload).length === 0) {
+    settingsMsg.textContent = "Nothing to save — fill in a field first.";
+    return;
+  }
+  settingsMsg.textContent = "Saving…";
+  try {
+    const data = await request("/api/settings", { method: "POST", body: JSON.stringify(payload) });
+    renderSettings(data);
+    clearSettingsInputs();
+    settingsMsg.textContent = "Saved.";
+  } catch (error) {
+    settingsMsg.textContent = `Save failed: ${error.message}`;
+  }
+}
+
+settingsOpen?.addEventListener("click", openSettings);
+settingsClose?.addEventListener("click", () => settingsDialog.close());
+settingsSave?.addEventListener("click", saveSettings);

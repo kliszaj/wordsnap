@@ -34,6 +34,12 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
+#include "esp_netif.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_http_client.h"
+#include "freertos/event_groups.h"
 #include "format_wav.h"
 
 static const char *TAG = "wordclip";
@@ -72,6 +78,7 @@ static const char *TAG = "wordclip";
 #define MIC_GAIN_DB     37.5f          /* ES7210 analog PGA near max; raise level for quiet capture */
 #define MAX_RECORD_SECONDS 15
 #define MIN_RECORD_MS      600
+#define SCREEN_IDLE_MS     30000       /* blank the LCD after this idle time (retention + power) */
 
 /* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
 #define C_WHITE   0xFFFF
@@ -83,6 +90,8 @@ static const char *TAG = "wordclip";
 #define C_MUTED    0xA534
 #define C_DOT      0x39E7
 #define C_DARK_RED 0xA145
+#define C_BLACK    0x0000
+#define C_BLUE     0x001F
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_touch_io = NULL;
@@ -94,6 +103,8 @@ static esp_codec_dev_handle_t s_codec = NULL;
 static int s_active_clip_index = 0;
 static bool s_recording_active = false;
 static bool s_touch_was_down = false;
+static bool s_screen_on = true;
+static int64_t s_last_activity_ms = 0;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
@@ -195,6 +206,24 @@ static void ui_show_saved(void)
     lcd_fill(C_WHITE);
     vTaskDelay(pdMS_TO_TICKS(180));
     ui_show_home();
+}
+
+/* ---------------- Screen power (idle blank to avoid LCD image retention) ---------------- */
+static void screen_sleep(void)
+{
+    lcd_fill(C_BLACK);              /* rest the pixels (no static red held) */
+    gpio_set_level(PIN_LCD_BL, 0);  /* backlight off saves power on the LiPo */
+    s_screen_on = false;
+    ESP_LOGI(TAG, "screen sleep (idle)");
+}
+
+static void screen_wake(void)
+{
+    gpio_set_level(PIN_LCD_BL, 1);
+    ui_show_home();
+    s_screen_on = true;
+    s_last_activity_ms = esp_timer_get_time() / 1000;
+    ESP_LOGI(TAG, "screen wake");
 }
 
 /* ---------------- Touch (CST816D/CST816S-compatible controller) ---------------- */
@@ -504,11 +533,147 @@ static void record_wav(int index)
     ui_show_saved();
 }
 
+/* ---------------- WiFi upload (creds + server URL from /sdcard/wifi.txt) ---------------- */
+typedef struct {
+    char ssid[64];
+    char password[96];
+    char server[128];
+} wifi_conf_t;
+
+/* Parse /sdcard/wifi.txt: one key=value per line (ssid=, password=, server=).
+ * Blank lines and lines starting with '#' are ignored. */
+static bool read_wifi_conf(wifi_conf_t *c)
+{
+    memset(c, 0, sizeof(*c));
+    strlcpy(c->server, "http://10.0.0.240:8092", sizeof(c->server));  /* default */
+
+    FILE *f = fopen(MOUNT_POINT "/wifi.txt", "r");
+    if (!f) {
+        ESP_LOGE(TAG, "wifi.txt not found on SD card");
+        return false;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p == '#' || *p == '\0' || *p == '\r' || *p == '\n') continue;
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p;
+        char *val = eq + 1;
+        for (size_t k = strlen(key); k > 0 && (key[k - 1] == ' ' || key[k - 1] == '\t'); ) key[--k] = '\0';
+        for (size_t v = strlen(val); v > 0 && (val[v - 1] == '\n' || val[v - 1] == '\r' ||
+                                               val[v - 1] == ' '  || val[v - 1] == '\t'); ) val[--v] = '\0';
+        if (strcmp(key, "ssid") == 0)                                  strlcpy(c->ssid, val, sizeof(c->ssid));
+        else if (strcmp(key, "password") == 0 || strcmp(key, "psk") == 0) strlcpy(c->password, val, sizeof(c->password));
+        else if (strcmp(key, "server") == 0)                           strlcpy(c->server, val, sizeof(c->server));
+    }
+    fclose(f);
+    if (!c->ssid[0]) {
+        ESP_LOGE(TAG, "wifi.txt is missing 'ssid='");
+        return false;
+    }
+    return true;
+}
+
+#define WIFI_CONNECTED_BIT BIT0
+#define WIFI_FAIL_BIT      BIT1
+static EventGroupHandle_t s_wifi_evt = NULL;
+static bool s_netstack_ready = false;
+static int s_wifi_retry = 0;
+
+static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data)
+{
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_event_sta_disconnected_t *d = (wifi_event_sta_disconnected_t *)data;
+        ESP_LOGW(TAG, "WiFi disconnected (reason=%d), retry %d", d ? d->reason : -1, s_wifi_retry);
+        if (s_wifi_retry < 8) {
+            s_wifi_retry++;
+            esp_wifi_connect();
+        } else {
+            xEventGroupSetBits(s_wifi_evt, WIFI_FAIL_BIT);
+        }
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
+        ESP_LOGI(TAG, "WiFi connected, IP: " IPSTR, IP2STR(&e->ip_info.ip));
+        s_wifi_retry = 0;
+        xEventGroupSetBits(s_wifi_evt, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t wifi_up(const wifi_conf_t *c)
+{
+    if (!s_netstack_ready) {
+        esp_err_t e = nvs_flash_init();
+        if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            ESP_ERROR_CHECK(nvs_flash_erase());
+            ESP_ERROR_CHECK(nvs_flash_init());
+        }
+        ESP_ERROR_CHECK(esp_netif_init());
+        ESP_ERROR_CHECK(esp_event_loop_create_default());
+        esp_netif_create_default_wifi_sta();
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        s_wifi_evt = xEventGroupCreate();
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                            wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                            wifi_event_handler, NULL, NULL));
+        s_netstack_ready = true;
+    }
+
+    wifi_config_t wc = {0};
+    strlcpy((char *)wc.sta.ssid, c->ssid, sizeof(wc.sta.ssid));
+    strlcpy((char *)wc.sta.password, c->password, sizeof(wc.sta.password));
+    wc.sta.threshold.authmode = c->password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+
+    s_wifi_retry = 0;
+    xEventGroupClearBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+    if (bits & WIFI_CONNECTED_BIT) return ESP_OK;
+    ESP_LOGE(TAG, "WiFi connect failed/timeout for ssid=%s", c->ssid);
+    esp_wifi_stop();
+    return ESP_FAIL;
+}
+
+static void wifi_down(void)
+{
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    ESP_LOGI(TAG, "WiFi stopped");
+}
+
 static void upload_pending_clips(void)
 {
-    /* TODO: enable WiFi, POST each /sdcard/rec_NNN.wav to /api/upload, delete on ACK.
-     * This is intentionally separate from capture mode; WiFi and I2S should not overlap. */
-    ESP_LOGW(TAG, "Upload requested but WiFi upload transport is not wired yet");
+    /* WiFi and I2S are used in separate modes (per PRD): upload only happens while idle. */
+    lcd_fill(C_BLUE);   /* on-screen "connecting…" feedback */
+
+    wifi_conf_t conf;
+    if (!read_wifi_conf(&conf)) {
+        ESP_LOGE(TAG, "Upload aborted: no usable /sdcard/wifi.txt");
+        lcd_fill(C_RED);
+        vTaskDelay(pdMS_TO_TICKS(900));
+        return;
+    }
+    ESP_LOGI(TAG, "Upload: connecting to ssid='%s' (server=%s)", conf.ssid, conf.server);
+    if (wifi_up(&conf) != ESP_OK) {
+        lcd_fill(C_RED);        /* connect failed/timeout */
+        vTaskDelay(pdMS_TO_TICKS(900));
+        return;
+    }
+    /* Stage 1: connectivity proven. Stage 2/3 will POST rec_*.wav to <server>/api/upload here. */
+    ESP_LOGI(TAG, "WiFi up — %d clip(s) pending (HTTP upload lands next stage)", pending_clip_count());
+    lcd_fill(C_GREEN);          /* connected OK */
+    vTaskDelay(pdMS_TO_TICKS(900));
+    wifi_down();
 }
 
 void app_main(void)
@@ -552,17 +717,36 @@ void app_main(void)
     ESP_ERROR_CHECK(gpio_config(&btn));
 
     int prev = 1, hb = 0;
+    s_last_activity_ms = esp_timer_get_time() / 1000;
     while (1) {
         if (++hb >= 50) {
             hb = 0;
-            ESP_LOGI(TAG, "hb: sd=%d audio=%d btn=%d", s_sd_ok, aerr == ESP_OK,
-                     gpio_get_level(PIN_BTN));
+            ESP_LOGI(TAG, "hb: sd=%d audio=%d btn=%d scr=%d", s_sd_ok, aerr == ESP_OK,
+                     gpio_get_level(PIN_BTN), s_screen_on);
         }
+        int64_t now_ms = esp_timer_get_time() / 1000;
         int level = gpio_get_level(PIN_BTN);
+
+        /* Screen asleep: any touch or BOOT press only wakes it (does not act). */
+        if (!s_screen_on) {
+            uint16_t tx = 0, ty = 0;
+            if (touch_press_edge(&tx, &ty) || (prev == 1 && level == 0)) {
+                screen_wake();
+            }
+            prev = level;
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
         touch_action_t touch_action = touch_home_action();
+        if (touch_action != TOUCH_ACTION_NONE || (prev == 1 && level == 0)) {
+            s_last_activity_ms = now_ms;
+        }
+
         if (touch_action == TOUCH_ACTION_UPLOAD) {
             upload_pending_clips();
             ui_show_home();
+            s_last_activity_ms = esp_timer_get_time() / 1000;
         }
         if ((prev == 1 && level == 0) || touch_action == TOUCH_ACTION_RECORD) {
             vTaskDelay(pdMS_TO_TICKS(30));
@@ -575,8 +759,16 @@ void app_main(void)
                 if (ready) ui_show_home();
                 else lcd_fill(C_MAGENTA);
                 while (gpio_get_level(PIN_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
+                s_last_activity_ms = esp_timer_get_time() / 1000;
             }
         }
+
+        /* Idle timeout: blank the LCD to prevent image retention and save power. */
+        if (s_screen_on && !s_recording_active &&
+            (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
+            screen_sleep();
+        }
+
         prev = level;
         vTaskDelay(pdMS_TO_TICKS(20));
     }

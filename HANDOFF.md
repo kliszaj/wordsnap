@@ -7,7 +7,7 @@ transcribes with Whisper, enriches with Claude, and produces reviewable Anki car
 Latest pushed commit at handoff time:
 
 ```text
-6f6e56e Apply selected ledger signal UI
+f63893c Compact pipeline cards
 ```
 
 Repo: <https://github.com/kliszaj/wordsnap>
@@ -44,6 +44,9 @@ Repo: <https://github.com/kliszaj/wordsnap>
 
 - **Review-first workflow:** uploaded clips should be reviewed/corrected in the web UI before Anki export.
 - **Device/website visual language:** dark charcoal, red recording accent, rounded pills, large tactile controls. See [docs/product-ui.md](docs/product-ui.md).
+- **Current website direction:** product title is `wordclip.`, using the review-ledger layout plus paper-tape pipeline cards and the subtler dot-grid palette.
+- **Toolbar decision:** remove app-level `Refresh` because browser refresh is enough; remove `UI directions` from the production toolbar; keep `Upload WAV` and `Export CSV`.
+- **Anki export decision:** CSV is acceptable for simple note import. `.apkg` is the packaged deck format, useful later if WordClip needs to bundle note types/media/scheduling.
 
 ---
 
@@ -226,6 +229,22 @@ The web UI supports:
 - approving cards
 - exporting approved Anki CSV at `/api/export/anki.csv`
 
+Latest local UI work since the last push:
+
+- Header title changed from `Review ledger` to `wordclip.`
+- Pipeline cards were compacted to remove excessive empty vertical space.
+- Pipeline card punch holes/subheaders were removed.
+- The Anki preview card was restyled to match the Transcription and Translation cards:
+  - `Card front` field
+  - `Card back` field
+  - same compact field treatment
+  - all three cards verified at `319px` height in browser DOM.
+- Toolbar reduced to:
+  - `Upload WAV`
+  - `Export CSV`
+- `Refresh` and `UI directions` were removed from the toolbar, and the unused refresh JS listener was removed.
+- `Upload WAV` was changed to use the same accent button styling family as `Export CSV`.
+
 API endpoints:
 
 - `GET /api/device/status`
@@ -244,9 +263,11 @@ Verification already done:
 - FastAPI `GET /` and `GET /api/device/status` smoke tests passed
 - `POST /api/upload` accepted a local WAV
 - ESP-IDF firmware build passed
+- Latest local web smoke check: `GET http://127.0.0.1:8080/` returned `200`.
+- Browser DOM check after toolbar cleanup showed only `Upload WAV` and `Export CSV` in `.toolbar-actions`.
 
-One thing not completed: browser visual screenshot pass. The in-app browser runtime was blocked by sandbox
-access to `AppData`, but HTTP smoke checks passed.
+Note: a browser crop screenshot attempt was visually offset/unhelpful, but DOM checks confirmed the important
+layout metrics. Full-page browser preview itself was reachable at `http://127.0.0.1:8080`.
 
 ---
 
@@ -283,34 +304,55 @@ Claude was chosen by user preference even though GPT recovered `skärgård` bett
 
 Start here:
 
-1. **Have the user visually check the web UI**
+1. **Respect the no-push instruction**
+   - User said: `dont push anything until i say so`.
+   - Do not commit or push unless explicitly told.
+   - Current uncommitted files at this handoff:
+     - [backend/web/index.html](backend/web/index.html)
+     - [backend/web/styles.css](backend/web/styles.css)
+     - [backend/web/app.js](backend/web/app.js)
+
+2. **Implement requested keyboard shortcuts**
+   - User asked whether they can use:
+     - Up/down arrow keys to move between clips.
+     - Spacebar to toggle selected clip between approved and in-review states.
+   - This was requested but not implemented before this handoff update.
+   - Recommended behavior:
+     - Do not trigger shortcuts while focus is inside `input`, `textarea`, `select`, button, link, or audio controls.
+     - Up/down should move `selectedClipId` through the current `clips` array and re-render.
+     - Space should approve the selected clip if it is not approved.
+     - Space should PATCH `{ "status": "needs_review" }` if the selected clip is already approved.
+     - `ClipPatch` in [backend/server.py](backend/server.py) already includes optional `status`, so the PATCH path should work.
+     - Consider updating the visible approve button label to reflect state, e.g. `Approve card` vs `Move to review`.
+
+3. **Have the user visually check the web UI**
    - Start server with the command above.
    - Open `http://127.0.0.1:8080`.
    - Ask what feels wrong visually/functionally.
 
-2. **Flash/test firmware touch**
+4. **Flash/test firmware touch**
    - CST816 touch is implemented and builds, but not yet flashed/tested on hardware.
    - Validate coordinates from logs before tightening hit targets.
 
-3. **Implement device upload transport**
+5. **Implement device upload transport**
    - Add WiFi config strategy first: hardcoded dev config vs provisioning.
    - Target server URL likely Hoth LAN IP, e.g. `http://192.168.x.x:8080`.
    - Implement multipart upload to `/api/upload`.
    - Delete each WAV only after ACK.
 
-4. **Polish server review workflow**
+6. **Polish server review workflow**
    - Add auto-process option after upload if user wants it.
    - Improve error display/loading states in web UI.
    - Add duplicate handling before Anki export.
    - Add direct AnkiConnect later.
 
-5. **Deploy on Unraid**
+7. **Deploy on Unraid**
    - Build and push `kliszaj/wordsnap:latest` from [docker-compose.build.yml](docker-compose.build.yml).
    - Use [docker-compose.unraid.yml](docker-compose.unraid.yml) on Hoth to pull the Docker Hub image.
    - Persist `/app/data` via `WORDSNAP_DATA_DIR`, likely `/mnt/user/appdata/wordsnap/data`.
    - Keep `backend/.env` private.
 
-6. **Hardware caution**
+8. **Hardware caution**
    - Firmware builds but the latest touch behavior was not flashed/tested on hardware yet.
    - Be careful not to open/reset COM3 while the user is actively recording.
 
@@ -327,4 +369,10 @@ Ignored local/runtime artifacts include:
 - `firmware/build/`
 - `firmware/managed_components/`
 
-Working tree was clean after push except ignored runtime/build files.
+Working tree is **not clean** at this handoff. The uncommitted changes are intentional local UI edits:
+
+- `backend/web/index.html`
+- `backend/web/styles.css`
+- `backend/web/app.js`
+
+Do not push them until the user says to.

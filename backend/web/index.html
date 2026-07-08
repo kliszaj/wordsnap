@@ -11,7 +11,7 @@
       <header class="app-header">
         <div>
           <p class="eyebrow">Hoth receiver</p>
-          <h1>Review ledger</h1>
+          <h1>wordclip.</h1>
         </div>
         <div class="metric-strip" aria-label="Dashboard metrics">
           <div class="metric">
@@ -32,8 +32,7 @@
           </div>
         </div>
         <div class="toolbar-actions">
-          <button id="refresh-button" class="ghost-button" type="button">Refresh</button>
-          <a class="ghost-button" href="/assets/directions.html">UI directions</a>
+          <button type="button" class="ghost-button" id="settings-open">Settings</button>
           <label class="file-button">
             Upload WAV
             <input id="file-input" type="file" accept="audio/wav,.wav" multiple />
@@ -55,6 +54,55 @@
         </div>
       </section>
     </main>
+
+    <dialog id="settings-dialog" class="settings-dialog">
+      <form id="settings-form" method="dialog">
+        <div class="settings-head">
+          <div>
+            <p class="eyebrow">Server settings</p>
+            <h2 class="settings-title">Credentials</h2>
+          </div>
+          <button type="button" class="ghost-button" id="settings-close">Close</button>
+        </div>
+        <p class="settings-note">
+          Stored on the server in appdata, not baked into the image. Leave a field blank to keep its
+          current value. Keys are never shown back — only a masked hint.
+        </p>
+
+        <fieldset class="settings-group">
+          <legend>LLM API keys</legend>
+          <label class="settings-field">
+            <span class="settings-label">Anthropic API key <em class="settings-status" id="status-anthropic"></em></span>
+            <input type="password" id="input-anthropic" autocomplete="off" spellcheck="false" placeholder="sk-ant-..." />
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">OpenAI API key <em class="settings-status" id="status-openai"></em></span>
+            <input type="password" id="input-openai" autocomplete="off" spellcheck="false" placeholder="sk-..." />
+          </label>
+        </fieldset>
+
+        <fieldset class="settings-group">
+          <legend>Models (optional overrides)</legend>
+          <label class="settings-field">
+            <span class="settings-label">Claude model</span>
+            <input type="text" id="input-claude-model" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">Whisper model</span>
+            <input type="text" id="input-whisper-model" autocomplete="off" spellcheck="false" />
+          </label>
+          <label class="settings-field">
+            <span class="settings-label">GPT model (lab compare)</span>
+            <input type="text" id="input-gpt-model" autocomplete="off" spellcheck="false" />
+          </label>
+        </fieldset>
+
+        <div class="settings-actions">
+          <span class="settings-msg" id="settings-msg" aria-live="polite"></span>
+          <button type="button" class="ghost-button strong" id="settings-save">Save</button>
+        </div>
+      </form>
+    </dialog>
 
     <template id="queue-template">
       <button class="queue-item" type="button">
@@ -127,8 +175,14 @@
               </div>
             </div>
             <div class="anki-preview" aria-label="Anki preview">
-              <div class="front"></div>
-              <div class="back"></div>
+              <div class="preview-field">
+                <span>Card front</span>
+                <div class="front"></div>
+              </div>
+              <div class="preview-field">
+                <span>Card back</span>
+                <div class="back"></div>
+              </div>
             </div>
             <button class="approve" type="button">Approve card</button>
           </section>
