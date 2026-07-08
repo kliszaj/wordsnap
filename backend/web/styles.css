@@ -383,10 +383,10 @@ h2 {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   gap: 14px;
   min-height: 520px;
-  padding: 18px;
+  padding: 20px;
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   background:
@@ -400,18 +400,6 @@ h2 {
     radial-gradient(rgba(235, 232, 223, 0.065) 0.8px, transparent 0.8px),
     linear-gradient(180deg, #221715, #121214);
   background-size: 24px 24px, auto;
-}
-
-.punches {
-  display: grid;
-  grid-template-columns: repeat(10, 1fr);
-  gap: 5px;
-}
-
-.punches span {
-  aspect-ratio: 1;
-  border-radius: 999px;
-  background: rgba(235, 232, 223, 0.13);
 }
 
 .card-head {
