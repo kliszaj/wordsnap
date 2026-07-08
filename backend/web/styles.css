@@ -29,10 +29,7 @@ html {
 body {
   margin: 0;
   min-height: 100dvh;
-  background:
-    radial-gradient(circle at 18% -10%, rgba(255, 83, 59, 0.16), transparent 30rem),
-    radial-gradient(circle at 88% 8%, rgba(235, 232, 223, 0.07), transparent 24rem),
-    var(--bg);
+  background: var(--bg);
   color: var(--text);
 }
 
@@ -42,9 +39,9 @@ body::before {
   inset: 0;
   z-index: -1;
   pointer-events: none;
-  opacity: 0.24;
+  opacity: 0.12;
   background-image: radial-gradient(rgba(235, 232, 223, 0.42) 0.8px, transparent 0.8px);
-  background-size: 14px 14px;
+  background-size: 24px 24px;
 }
 
 button,
@@ -202,9 +199,9 @@ h2 {
   border: 1px solid var(--line);
   border-radius: 14px;
   background:
-    radial-gradient(rgba(235, 232, 223, 0.14) 0.8px, transparent 0.8px),
+    radial-gradient(rgba(235, 232, 223, 0.08) 0.8px, transparent 0.8px),
     rgba(235, 232, 223, 0.055);
-  background-size: 14px 14px;
+  background-size: 24px 24px;
 }
 
 .clip-queue {
@@ -282,9 +279,9 @@ h2 {
 .clip-detail {
   min-width: 0;
   background:
-    radial-gradient(rgba(235, 232, 223, 0.18) 0.8px, transparent 0.8px),
+    radial-gradient(rgba(235, 232, 223, 0.09) 0.8px, transparent 0.8px),
     var(--panel);
-  background-size: 14px 14px;
+  background-size: 24px 24px;
 }
 
 .clip {
@@ -393,16 +390,16 @@ h2 {
   border: 1px solid var(--line-strong);
   border-radius: 10px;
   background:
-    radial-gradient(rgba(235, 232, 223, 0.11) 0.8px, transparent 0.8px),
+    radial-gradient(rgba(235, 232, 223, 0.07) 0.8px, transparent 0.8px),
     linear-gradient(180deg, #171a1d, #101214);
-  background-size: 14px 14px, auto;
+  background-size: 24px 24px, auto;
 }
 
 .tape-card:nth-child(2) {
   background:
-    radial-gradient(rgba(235, 232, 223, 0.1) 0.8px, transparent 0.8px),
+    radial-gradient(rgba(235, 232, 223, 0.065) 0.8px, transparent 0.8px),
     linear-gradient(180deg, #221715, #121214);
-  background-size: 14px 14px, auto;
+  background-size: 24px 24px, auto;
 }
 
 .punches {
