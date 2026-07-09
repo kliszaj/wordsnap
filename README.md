@@ -2,7 +2,7 @@
 
 WordSnap is a handheld Swedish vocabulary capture pipeline:
 
-1. ESP32-C6 device records short WAV clips.
+1. ESP32-C6 device records short WAV snips.
 2. Hoth/Unraid receiver accepts uploads.
 3. OpenAI Whisper transcribes Swedish audio.
 4. Claude enriches the target word.
@@ -37,7 +37,7 @@ http://localhost:8080
 
 ## Batch Import
 
-Import clips without processing:
+Import snips without processing:
 
 ```powershell
 backend\.venv\Scripts\python.exe backend\process_folder.py test-clips --no-process
@@ -133,4 +133,4 @@ WordSnap reaches AnkiConnect internally at `http://anki:8765`; do not expose por
 
 ## Device UI
 
-See `firmware/DEVICE_UI.md`. The current firmware has the home/recording UI state machine, touch start/stop, and BOOT-button fallback. The next firmware pass is WiFi upload transport to `POST /api/upload`.
+See `firmware/DEVICE_UI.md`. The current firmware has the home/recording UI state machine, touch start/stop, batch upload to `POST /api/upload`, battery charging states, and BOOT as a wake/sleep-only power button.

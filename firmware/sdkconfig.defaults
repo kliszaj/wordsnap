@@ -10,3 +10,7 @@ CONFIG_FATFS_MAX_LFN=255
 
 # A little more main-task stack headroom for the capture/WAV work
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Power management: allow automatic light sleep between polling ticks.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y

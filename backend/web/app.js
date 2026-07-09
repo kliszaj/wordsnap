@@ -114,7 +114,7 @@ function setQueuePlaybackState() {
     const play = row.querySelector(".queue-play");
     play?.classList.toggle("playing", isPlayingRow);
     play?.style.setProperty("--progress", `${progress * 360}deg`);
-    play?.setAttribute("aria-label", isPlayingRow ? "Pause clip" : "Play clip");
+    play?.setAttribute("aria-label", isPlayingRow ? "Pause snip" : "Play snip");
   });
 }
 
@@ -146,7 +146,7 @@ function renderQueue() {
   if (!clips.length) {
     const empty = document.createElement("div");
     empty.className = "empty queue-empty";
-    empty.textContent = "No clips yet. Upload WAV files or sync from the device.";
+    empty.textContent = "No snips yet. Upload WAV files or sync from the device.";
     queueList.append(empty);
     return;
   }
@@ -158,7 +158,7 @@ function renderQueue() {
     node.classList.toggle("active", clip.id === selectedClipId);
     item.classList.toggle("active", clip.id === selectedClipId);
     node.querySelector(".queue-title").textContent = clipFront(clip);
-    node.querySelector(".queue-meta").textContent = `CLIP ${clipNumber(clip, index)}`;
+    node.querySelector(".queue-meta").textContent = `SNIP ${clipNumber(clip, index)}`;
     const playButton = node.querySelector(".queue-play");
     playButton.addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -167,7 +167,7 @@ function renderQueue() {
       try {
         await toggleQueuePlayback(clip);
       } catch (error) {
-        console.error("Could not play clip", error);
+        console.error("Could not play snip", error);
       }
     });
     item.addEventListener("click", () => {
@@ -195,7 +195,7 @@ function renderDetail() {
   if (!clip) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = clips.length ? "Select a clip from the ledger." : "The selected clip will appear here.";
+    empty.textContent = clips.length ? "Select a snip from the ledger." : "The selected snip will appear here.";
     detail.append(empty);
     return;
   }
@@ -287,8 +287,8 @@ fileInput.addEventListener("change", async () => {
 });
 
 loadClips().catch((error) => {
-  queueList.innerHTML = `<div class="empty queue-empty">Could not load clips: ${error.message}</div>`;
-  detail.innerHTML = `<div class="empty">Could not load clip detail.</div>`;
+  queueList.innerHTML = `<div class="empty queue-empty">Could not load snips: ${error.message}</div>`;
+  detail.innerHTML = `<div class="empty">Could not load snip detail.</div>`;
 });
 
 // ---- Settings (LLM credentials, persisted to appdata) ----
@@ -409,3 +409,30 @@ setInterval(() => {
   if (!hasProcessingClips() || isTypingTarget(document.activeElement) || settingsDialog.open) return;
   loadClips().catch(() => {});
 }, 5000);
+
+// ---- Auto-sync toggle (auto-save new snips to Anki + sync to phone) ----
+const autoSyncInput = document.querySelector("#auto-sync-input");
+
+async function loadAutoSync() {
+  try {
+    const data = await request("/api/auto-sync");
+    autoSyncInput.checked = Boolean(data.enabled);
+  } catch {
+    // leave the default (checked) if the server can't be reached
+  }
+}
+
+autoSyncInput?.addEventListener("change", async () => {
+  const enabled = autoSyncInput.checked;
+  try {
+    const data = await request("/api/auto-sync", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    autoSyncInput.checked = Boolean(data.enabled);
+  } catch {
+    autoSyncInput.checked = !enabled; // revert on failure
+  }
+});
+
+loadAutoSync();

@@ -31,7 +31,8 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 SECRET_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 MODEL_KEYS = ("WHISPER_MODEL", "CLAUDE_MODEL", "GPT_MODEL")
 ANKI_KEYS = ("ANKI_CONNECT_URL", "ANKI_DECK")
-MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS + ANKI_KEYS
+FLAG_KEYS = ("AUTO_ANKI",)  # boolean-ish flags stored as "1"/"0"
+MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS + ANKI_KEYS + FLAG_KEYS
 
 _MODEL_DEFAULTS = {
     "WHISPER_MODEL": DEFAULT_WHISPER_MODEL,
@@ -42,6 +43,11 @@ _MODEL_DEFAULTS = {
 # Snapshot the container/host environment at import so the appdata file can override
 # it and clearing a field can fall back to (or fully drop below) it.
 _ENV_BASELINE = {name: os.environ.get(name) for name in MANAGED_KEYS}
+
+
+def auto_anki_enabled() -> bool:
+    """Whether each upload auto-saves to Anki and syncs. Default ON when unset."""
+    return os.getenv("AUTO_ANKI", "1").strip().lower() not in ("0", "false", "off", "no")
 
 
 def _read_file() -> dict[str, Any]:

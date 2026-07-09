@@ -6,7 +6,7 @@
  *   - Home view: upload pill + large red record button
  *   - Recording view: dark dotted field + stop-capable capture
  *   - microSD (FAT32) over shared SPI2 bus
- *   - Capacitive touch starts/stops recording; BOOT (GPIO9) remains a debug fallback
+ *   - Capacitive touch starts/stops recording; BOOT (GPIO9) wakes/sleeps the screen
  *
  * Audio: ES7210 4-ch ADC (we use MIC1+MIC2), I2S TDM 2-slot, 16 kHz / 16-bit stereo.
  * Pins (schematic Rev1.2 + Waveshare examples):
@@ -41,6 +41,8 @@
 #include "esp_log.h"
 #include "esp_check.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -91,11 +93,18 @@ static const char *TAG = "wordclip";
 #define MIN_RECORD_MS      600
 #define SCREEN_IDLE_MS     30000       /* blank the LCD after this idle time (retention + power) */
 #define WAKE_BATTERY_MS     2000
+#define CHARGE_CHECK_MS     5000
+
+/* On-device speaker preview is disabled: the ES8311 playback path never drove the
+ * NS4150B amp correctly and the hardware speaker is being removed. All playback,
+ * ES8311 codec init, and the per-clip play button are gated off here. Flip to 1
+ * to bring the preview path (and play button) back. */
+#define SPEAKER_ENABLED 0
 
 /* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
 #define C_WHITE   0xFFFF
 #define C_RED     0xFA69   /* #FF4D4D in RGB565 */
-#define C_GREEN   0x07E0
+#define C_GREEN   0x5D2B   /* #58A75D in RGB565 */
 #define C_AMBER   0xDD65
 #define C_MAGENTA 0xF81F
 #define C_BG       0x1082
@@ -118,16 +127,18 @@ static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_axp = NULL;
 static bool s_sd_ok = false;
 static i2s_chan_handle_t s_i2s_rx = NULL;
-static i2s_chan_handle_t s_i2s_tx = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
-static esp_codec_dev_handle_t s_play_codec = NULL;
 static const audio_codec_ctrl_if_t *s_rec_ctrl_if = NULL;
 static const audio_codec_data_if_t *s_rec_data_if = NULL;
 static const audio_codec_if_t *s_rec_codec_if = NULL;
+#if SPEAKER_ENABLED
+static i2s_chan_handle_t s_i2s_tx = NULL;
+static esp_codec_dev_handle_t s_play_codec = NULL;
 static const audio_codec_ctrl_if_t *s_play_ctrl_if = NULL;
 static const audio_codec_data_if_t *s_play_data_if = NULL;
 static const audio_codec_gpio_if_t *s_play_gpio_if = NULL;
 static const audio_codec_if_t *s_play_codec_if = NULL;
+#endif
 static int s_active_clip_index = 0;
 static bool s_recording_active = false;
 static bool s_touch_was_down = false;
@@ -137,6 +148,9 @@ static char s_timer_prev[6] = "";
 static int s_wave_x = 0;
 static int s_upload_prev_pct = -1;
 static bool s_upload_prev_done = false;
+static int s_home_charge_state = -1;
+static int s_home_charge_pct = -1;
+static int64_t s_next_charge_check_ms = 0;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
@@ -153,30 +167,29 @@ typedef enum {
 /* ---------------- LCD ---------------- */
 static void lcd_fill(uint16_t color)
 {
-    static uint16_t line[LCD_H_RES];
+    /* Paint in multi-line strips: one SPI transaction per strip instead of one
+     * per row cuts a full-screen fill from 284 transactions to ~9, so a screen
+     * repaint is fast enough to not read as a flash. */
+    enum { FILL_STRIP = 32 };
+    static uint16_t buf[LCD_H_RES * FILL_STRIP];
     uint16_t v = sw16(color);
-    for (int x = 0; x < LCD_H_RES; x++) line[x] = v;
-    for (int y = 0; y < LCD_V_RES; y++) {
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, line);
+    for (int i = 0; i < LCD_H_RES * FILL_STRIP; i++) buf[i] = v;
+    for (int y = 0; y < LCD_V_RES; y += FILL_STRIP) {
+        int h = (LCD_V_RES - y < FILL_STRIP) ? (LCD_V_RES - y) : FILL_STRIP;
+        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + h, buf);
     }
 }
 
-static void ui_transition_begin(void)
-{
-    if (s_screen_on) gpio_set_level(PIN_LCD_BL, 0);
-}
-
-static void ui_transition_end(void)
-{
-    if (s_screen_on) {
-        gpio_set_level(PIN_LCD_BL, 1);
-        vTaskDelay(pdMS_TO_TICKS(12));
-    }
-}
+/* Transitions used to blank the backlight while the new view painted, but the
+ * SPI paint is slow enough that the blanked window read as an ugly black flash.
+ * Every view shares the C_BG background, so we now repaint in place with the
+ * backlight on: the old view is overwritten by a quick C_BG sweep and the new
+ * elements draw straight on top — no black interstitial. */
+static void ui_transition_begin(void) { }
+static void ui_transition_end(void) { }
 
 static void ui_transition_fill(uint16_t color)
 {
-    ui_transition_begin();
     lcd_fill(color);
 }
 
@@ -422,14 +435,14 @@ static void draw_pill_pressed(int y, const char *label)
 static void draw_clips_pill(int pending)
 {
     char label[20];
-    snprintf(label, sizeof(label), "CLIPS [%d]", pending);
+    snprintf(label, sizeof(label), "SNAPS [%d]", pending);
     draw_pill_button(32, label, true);
 }
 
 static void draw_clips_pill_pressed(int pending)
 {
     char label[20];
-    snprintf(label, sizeof(label), "CLIPS [%d]", pending);
+    snprintf(label, sizeof(label), "SNAPS [%d]", pending);
     draw_pill_pressed(32, label);
 }
 
@@ -459,17 +472,22 @@ static void ui_show_battery(int pct)
     ui_transition_end();
 }
 
+static bool axp_ready(void)
+{
+    if (!s_i2c_bus) return false;
+    if (s_axp) return true;
+
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = AXP2101_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    return i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) == ESP_OK;
+}
+
 static int battery_percent(void)
 {
-    if (!s_i2c_bus) return 50;
-    if (!s_axp) {
-        i2c_device_config_t cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = AXP2101_ADDR,
-            .scl_speed_hz = 400000,
-        };
-        if (i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) != ESP_OK) return 50;
-    }
+    if (!axp_ready()) return 50;
     uint8_t reg = 0xA4, pct = 0;
     if (i2c_master_transmit_receive(s_axp, &reg, 1, &pct, 1, 100) != ESP_OK) return 50;
     if (pct > 100) return 50;
@@ -478,18 +496,135 @@ static int battery_percent(void)
 
 static bool axp_vbus_good(void)
 {
-    if (!s_i2c_bus) return true;
-    if (!s_axp) {
-        i2c_device_config_t cfg = {
-            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
-            .device_address = AXP2101_ADDR,
-            .scl_speed_hz = 400000,
-        };
-        if (i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) != ESP_OK) return true;
-    }
+    if (!axp_ready()) return true;
     uint8_t reg = 0x00, status = 0;
     if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return true;
     return (status & (1 << 5)) != 0;  /* AXP2101 reg00H[5] = VBUS_GOOD */
+}
+
+static bool axp_power_present(void)
+{
+    if (!axp_ready()) return false;
+    uint8_t reg = 0x00, status = 0;
+    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return false;
+    return (status & (1 << 5)) != 0;
+}
+
+static bool axp_is_charging(void)
+{
+    if (!axp_ready()) return false;
+    uint8_t reg = 0x01, status = 0;
+    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return false;
+    return (status >> 5) == 0x01;
+}
+
+static void draw_charge_bolt_at(int ox, int oy, uint16_t color)
+{
+    static const uint8_t px[] = {11, 0, 7, 3, 19, 12};
+    static const uint8_t py[] = {0, 17, 17, 31, 11, 11};
+    const int n = 6;
+    for (int yy = 0; yy <= 31; yy++) {
+        int hits[6];
+        int hit_count = 0;
+        for (int i = 0; i < n; i++) {
+            int j = (i + 1) % n;
+            if ((py[i] <= yy && py[j] > yy) || (py[j] <= yy && py[i] > yy)) {
+                hits[hit_count++] = px[i] + (yy - py[i]) * (px[j] - px[i]) / (py[j] - py[i]);
+            }
+        }
+        for (int i = 0; i + 1 < hit_count; i += 2) {
+            if (hits[i] > hits[i + 1]) {
+                int tmp = hits[i];
+                hits[i] = hits[i + 1];
+                hits[i + 1] = tmp;
+            }
+            lcd_rect(ox + hits[i], oy + yy, ox + hits[i + 1] + 1, oy + yy + 1, color);
+        }
+    }
+}
+
+static void draw_small_percent(int x, int y, uint16_t color)
+{
+    lcd_disc(x + 2, y + 3, 2, color);
+    lcd_disc(x + 10, y + 13, 2, color);
+    lcd_line(x + 12, y + 0, x + 0, y + 16, 2, color);
+}
+
+static int percent_width(void)
+{
+    return 15;
+}
+
+static void draw_label_with_percent(int x, int y, const char *text, uint16_t color)
+{
+    size_t len = strlen(text);
+    if (len > 0 && text[len - 1] == '%') {
+        char buf[24];
+        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+        memcpy(buf, text, len - 1);
+        buf[len - 1] = '\0';
+        draw_label_text(x, y, buf, color);
+        draw_small_percent(x + label_width(buf) + 2, y + 1, color);
+    } else {
+        draw_label_text(x, y, text, color);
+    }
+}
+
+static int label_with_percent_width(const char *text)
+{
+    size_t len = strlen(text);
+    if (len > 0 && text[len - 1] == '%') {
+        char buf[24];
+        if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+        memcpy(buf, text, len - 1);
+        buf[len - 1] = '\0';
+        return label_width(buf) + 2 + percent_width();
+    }
+    return label_width(text);
+}
+
+static void ui_home_charge_indicator(int state, int pct)
+{
+    lcd_rect(0, 248, LCD_H_RES, 276, C_BG);
+    if (state == 1) {
+        char pct_text[8];
+        snprintf(pct_text, sizeof(pct_text), "%d%%", pct);
+        int bolt_text_gap = 12;
+        int row_w = 19 + bolt_text_gap + label_width("CHARGING") + 8 + label_with_percent_width(pct_text);
+        int x = (LCD_H_RES - row_w) / 2;
+        draw_charge_bolt_at(x, 250, C_AMBER);
+        draw_label_text(x + 19 + bolt_text_gap, 256, "CHARGING", C_AMBER);
+        draw_label_with_percent(x + 19 + bolt_text_gap + label_width("CHARGING") + 8, 256, pct_text, C_AMBER);
+    } else if (state == 2) {
+        char pct_text[8];
+        snprintf(pct_text, sizeof(pct_text), "%d%%", pct);
+        int bolt_text_gap = 12;
+        int row_w = 19 + bolt_text_gap + label_with_percent_width(pct_text);
+        int x = (LCD_H_RES - row_w) / 2;
+        draw_charge_bolt_at(x, 250, C_GREEN);
+        draw_label_with_percent(x + 19 + bolt_text_gap, 256, pct_text, C_GREEN);
+    }
+    s_home_charge_state = state;
+    s_home_charge_pct = pct;
+}
+
+static void ui_home_poll_charge_indicator(int64_t now_ms)
+{
+    if (now_ms < s_next_charge_check_ms) return;
+    int state = 0;
+    int pct = -1;
+    if (axp_power_present()) {
+        pct = battery_percent();
+        if (axp_is_charging()) {
+            state = 1;
+        } else {
+            state = 2;
+        }
+    }
+    if (state != s_home_charge_state || (state == 1 && pct != s_home_charge_pct)) {
+        ui_home_charge_indicator(state, pct);
+    }
+    s_next_charge_check_ms = now_ms + CHARGE_CHECK_MS;
 }
 
 static void ui_show_home(void)
@@ -499,6 +634,10 @@ static void ui_show_home(void)
     lcd_disc(120, 180, 67, C_RING);
     lcd_circle_outline(120, 180, 59, 3, C_PANEL);
     lcd_disc(120, 180, 47, C_RED);
+    s_home_charge_state = -1;
+    s_home_charge_pct = -1;
+    ui_home_poll_charge_indicator(0);
+    s_next_charge_check_ms = (esp_timer_get_time() / 1000) + CHARGE_CHECK_MS;
     ui_transition_end();
 
     ESP_LOGI(TAG, "UI home: pending=%d", pending_clip_count());
@@ -514,6 +653,7 @@ static void ui_home_record_pressed(void)
     vTaskDelay(pdMS_TO_TICKS(25));
 }
 
+#if SPEAKER_ENABLED
 static void draw_play_icon(int cx, int cy, uint16_t color)
 {
     for (int row = -10; row <= 10; row++) {
@@ -521,6 +661,7 @@ static void draw_play_icon(int cx, int cy, uint16_t color)
         lcd_line(cx - 5, cy + row, cx - 5 + half, cy + row, 1, color);
     }
 }
+#endif
 
 static void draw_x_icon(int cx, int cy, uint16_t color)
 {
@@ -569,16 +710,20 @@ static void ui_show_clip_menu(const int *indices, int visible, int total, int of
     draw_upload_pill(total);
 
     if (total == 0) {
-        draw_label_text((LCD_H_RES - label_width("NO CLIPS")) / 2, 132, "NO CLIPS", C_DISABLED);
+        draw_label_text((LCD_H_RES - label_width("NO SNAPS")) / 2, 132, "NO SNAPS", C_DISABLED);
     }
 
     for (int i = 0; i < visible; i++) {
         int y = 70 + i * 64;
         char label[16];
-        snprintf(label, sizeof(label), "CLIP %03d", indices[i]);
+        snprintf(label, sizeof(label), "SNAP %03d", indices[i]);
         lcd_rect(18, y + 58, 222, y + 59, C_LINE);
+#if SPEAKER_ENABLED
         draw_play_icon(33, y + 29, C_TEXT);
         draw_label_text(58, y + 22, label, C_TEXT);
+#else
+        draw_label_text(30, y + 22, label, C_TEXT);
+#endif
         draw_x_icon(210, y + 29, C_RED);
     }
 
@@ -660,6 +805,7 @@ static void ui_recording_update_levels(uint8_t level)
     if (s_wave_x + bar_w >= right) s_wave_x = left;
 }
 
+#if SPEAKER_ENABLED
 static void ui_playback_update_levels(uint32_t frame)
 {
     const int left = 0;
@@ -684,6 +830,7 @@ static void ui_playback_update_levels(uint32_t frame)
     s_wave_x += step;
     if (s_wave_x + bar_w >= right) s_wave_x = left;
 }
+#endif
 
 static void ui_show_recording(uint32_t elapsed_ms)
 {
@@ -699,6 +846,7 @@ static void ui_show_recording(uint32_t elapsed_ms)
     ESP_LOGI(TAG, "UI recording: clip=%03d elapsed=%" PRIu32 "ms pct=%d", s_active_clip_index, elapsed_ms, pct);
 }
 
+#if SPEAKER_ENABLED
 static void ui_show_playback(int clip_index, uint32_t elapsed_ms)
 {
     memset(s_timer_prev, 0, sizeof(s_timer_prev));
@@ -712,6 +860,7 @@ static void ui_show_playback(int clip_index, uint32_t elapsed_ms)
     lcd_rect(0, 116, LCD_H_RES, 198, C_BG);
     lcd_rect(0, 197, LCD_H_RES, 198, C_LINE);
 }
+#endif
 
 static void ui_show_saved(uint32_t elapsed_ms)
 {
@@ -734,19 +883,33 @@ static void ui_show_connecting(void)
     s_upload_prev_done = false;
 }
 
+static void ui_draw_upload_percent(int pct)
+{
+    lcd_rect(20, 96, 220, 170, C_BG);
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", pct);
+    draw_big_text((LCD_H_RES - big_width(label)) / 2, 104, label, C_TEXT);
+}
+
 static void ui_show_uploading(int pct)
 {
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+
     bool done = pct >= 100;
     if (s_upload_prev_pct < 0) {
         ui_transition_fill(C_BG);
         ui_transition_end();
+        ui_draw_upload_percent(pct);
+    } else if (s_upload_prev_pct != pct) {
+        int start = s_upload_prev_pct;
+        int step = (pct > start) ? 1 : -1;
+        for (int value = start + step; value != pct + step; value += step) {
+            ui_draw_upload_percent(value);
+            vTaskDelay(pdMS_TO_TICKS(12));
+        }
     }
-    if (s_upload_prev_pct != pct) {
-        lcd_rect(20, 96, 220, 170, C_BG);
-    }
-    char label[8];
-    snprintf(label, sizeof(label), "%d%%", pct);
-    draw_big_text((LCD_H_RES - big_width(label)) / 2, 104, label, C_TEXT);
+
     if (s_upload_prev_done != done || s_upload_prev_pct < 0) {
         draw_status(230, C_GREEN, done ? "DONE" : "UPLOADING...");
     }
@@ -783,6 +946,16 @@ static void screen_wake(void)
     s_screen_on = true;
     s_last_activity_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "screen wake");
+}
+
+static void wait_for_button_release(void)
+{
+    int64_t start_ms = esp_timer_get_time() / 1000;
+    while (gpio_get_level(PIN_BTN) == 0) {
+        if ((esp_timer_get_time() / 1000) - start_ms > 1500) break;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    vTaskDelay(pdMS_TO_TICKS(80));
 }
 
 /* ---------------- Touch (CST816D/CST816S-compatible controller) ---------------- */
@@ -904,6 +1077,32 @@ static esp_err_t lcd_init(void)
 
     ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
     ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
+
+    /* Contrast/color tuning. The generic esp_lcd ST7789 init leaves the panel at
+     * its power-on register defaults, which look washed out (light grays, grey
+     * "blacks", flat color). Push the standard Waveshare ST7789 VCOM/power/gamma
+     * values for deeper blacks and more saturated color. Safe to send post-init.
+     * If blacks still look grey, raise VCOMS (0xBB) toward 0x28. */
+    static const struct { uint8_t cmd; uint8_t len; uint8_t data[14]; } st7789_tune[] = {
+        {0xB2, 5, {0x0C, 0x0C, 0x00, 0x33, 0x33}},              /* PORCTRL   */
+        {0xB7, 1, {0x35}},                                      /* GCTRL     */
+        {0xBB, 1, {0x19}},                                      /* VCOMS (black level) */
+        {0xC0, 1, {0x2C}},                                      /* LCMCTRL   */
+        {0xC2, 1, {0x01}},                                      /* VDVVRHEN  */
+        {0xC3, 1, {0x12}},                                      /* VRHS (contrast) */
+        {0xC4, 1, {0x20}},                                      /* VDVS      */
+        {0xC6, 1, {0x0F}},                                      /* FRCTRL2 (~60Hz) */
+        {0xD0, 2, {0xA4, 0xA1}},                                /* PWCTRL1   */
+        {0xE0, 14, {0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F,
+                    0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23}}, /* + gamma   */
+        {0xE1, 14, {0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F,
+                    0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23}}, /* - gamma   */
+    };
+    for (size_t i = 0; i < sizeof(st7789_tune) / sizeof(st7789_tune[0]); i++) {
+        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io, st7789_tune[i].cmd,
+                                                  st7789_tune[i].data, st7789_tune[i].len));
+    }
+
     ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
     return ESP_OK;
@@ -933,6 +1132,9 @@ static bool sd_mount(void)
 }
 
 /* ---------------- Audio (ES7210) ---------------- */
+/* Only the (disabled) speaker preview needs to release the mic mid-session; the
+ * recorder keeps it open, so this is gated with the playback path. */
+#if SPEAKER_ENABLED
 static void audio_input_deinit(void)
 {
     if (s_codec) {
@@ -988,6 +1190,7 @@ static void audio_output_deinit(void)
         s_i2s_tx = NULL;
     }
 }
+#endif
 
 static esp_err_t audio_init(void)
 {
@@ -1080,6 +1283,7 @@ static esp_err_t audio_init(void)
     return ESP_OK;
 }
 
+#if SPEAKER_ENABLED
 static esp_err_t audio_output_init(uint32_t sample_rate, int channels, int bits_per_sample)
 {
     if (s_play_codec && s_i2s_tx) return ESP_OK;
@@ -1166,6 +1370,7 @@ static esp_err_t audio_output_init(uint32_t sample_rate, int channels, int bits_
     ESP_LOGI(TAG, "ES8311 ready: %" PRIu32 " Hz, %d ch, %d-bit", sample_rate, channels, bits_per_sample);
     return ESP_OK;
 }
+#endif
 
 static bool parse_clip_index(const char *name, int *index)
 {
@@ -1327,7 +1532,6 @@ static void record_wav(int index)
     int64_t last_level_ms = 0;
     int64_t start_tick = esp_timer_get_time() / 1000;
     uint32_t elapsed_ms = 0;
-    bool stop_armed = false;
     while (written < max_wav_size) {
         size_t to_read = sizeof(buf);
         if (max_wav_size - written < to_read) to_read = max_wav_size - written;
@@ -1351,9 +1555,7 @@ static void record_wav(int index)
             last_level_ms = elapsed_ms;
         }
 
-        if (gpio_get_level(PIN_BTN) == 1) stop_armed = true;
-        bool stop_pressed = stop_armed && gpio_get_level(PIN_BTN) == 0;
-        if (elapsed_ms > MIN_RECORD_MS && (stop_pressed || touch_record_pressed())) {
+        if (elapsed_ms > MIN_RECORD_MS && touch_record_pressed()) {
             ESP_LOGI(TAG, "Stop requested at %" PRIu32 "ms", elapsed_ms);
             break;
         }
@@ -1693,6 +1895,7 @@ static void upload_pending_clips(void)
     ESP_LOGI(TAG, "Sync finished: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
 }
 
+#if SPEAKER_ENABLED
 static void preview_clip_index(int index)
 {
     char path[80];
@@ -1700,7 +1903,7 @@ static void preview_clip_index(int index)
     FILE *f = fopen(path, "rb");
     if (!f) {
         ESP_LOGW(TAG, "preview open failed: %s", path);
-        ui_show_error("NO CLIP");
+        ui_show_error("NO SNAP");
         vTaskDelay(pdMS_TO_TICKS(900));
         return;
     }
@@ -1714,7 +1917,7 @@ static void preview_clip_index(int index)
         (hdr.fmt_chunk.bits_per_sample != 16 && hdr.fmt_chunk.bits_per_sample != 32)) {
         fclose(f);
         ESP_LOGW(TAG, "preview unsupported WAV: %s", path);
-        ui_show_error("NO CLIP");
+        ui_show_error("NO SNAP");
         vTaskDelay(pdMS_TO_TICKS(900));
         return;
     }
@@ -1767,6 +1970,7 @@ static void preview_clip_index(int index)
     draw_status(235, C_GREEN, "DONE");
     vTaskDelay(pdMS_TO_TICKS(350));
 }
+#endif
 
 static void clip_menu_loop(void)
 {
@@ -1808,6 +2012,7 @@ static void clip_menu_loop(void)
 
             for (int i = 0; i < visible; i++) {
                 int row_y = 70 + i * 64;
+#if SPEAKER_ENABLED
                 if (hit_rect(x, y, 0, row_y, 70, row_y + 58)) {
                     draw_icon_press_flash(33, row_y + 29, false);
                     preview_clip_index(indices[i]);
@@ -1817,6 +2022,7 @@ static void clip_menu_loop(void)
                     ui_show_clip_menu(indices, visible, total, offset);
                     break;
                 }
+#endif
                 if (hit_rect(x, y, 176, row_y, 240, row_y + 58)) {
                     draw_icon_press_flash(210, row_y + 29, true);
                     delete_clip_index(indices[i]);
@@ -1863,13 +2069,13 @@ void app_main(void)
     }
     esp_err_t terr = touch_init();
     if (terr != ESP_OK) {
-        ESP_LOGE(TAG, "touch_init failed: %s -- BOOT fallback remains available", esp_err_to_name(terr));
+        ESP_LOGE(TAG, "touch_init failed: %s -- BOOT can still wake/sleep, but recording requires touch", esp_err_to_name(terr));
     }
     bool ready = s_sd_ok && (aerr == ESP_OK);
 
     if (ready) ui_show_home();
     else lcd_fill(C_MAGENTA);
-    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d touch=%d). Tap record or press BOOT to record; tap/press again to stop.",
+    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d touch=%d). Tap onscreen record to start/stop; BOOT wakes/sleeps.",
              ready, s_sd_ok, aerr == ESP_OK, terr == ESP_OK);
 
     gpio_config_t btn = {
@@ -1878,6 +2084,20 @@ void app_main(void)
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&btn));
+    gpio_wakeup_enable(PIN_BTN, GPIO_INTR_LOW_LEVEL);
+    esp_sleep_enable_gpio_wakeup();
+
+    esp_pm_config_t pm_config = {
+        .max_freq_mhz = 160,
+        .min_freq_mhz = 40,
+        .light_sleep_enable = true,
+    };
+    esp_err_t pm_err = esp_pm_configure(&pm_config);
+    if (pm_err != ESP_OK) {
+        ESP_LOGW(TAG, "PM configure failed: %s", esp_err_to_name(pm_err));
+    } else {
+        ESP_LOGI(TAG, "PM enabled: 160/40 MHz, auto light sleep");
+    }
 
     int prev = 1, hb = 0;
     s_last_activity_ms = esp_timer_get_time() / 1000;
@@ -1890,19 +2110,34 @@ void app_main(void)
         int64_t now_ms = esp_timer_get_time() / 1000;
         int level = gpio_get_level(PIN_BTN);
 
-        /* Screen asleep: any touch or BOOT press only wakes it (does not act). */
+        /* Screen asleep: block in light sleep; BOOT press wakes only, it does not act. */
         if (!s_screen_on) {
-            uint16_t tx = 0, ty = 0;
-            if (touch_press_edge(&tx, &ty) || (prev == 1 && level == 0)) {
+            ESP_LOGI(TAG, "enter light sleep; BOOT wakes screen");
+            esp_err_t sleep_err = esp_light_sleep_start();
+            if (sleep_err != ESP_OK) {
+                ESP_LOGW(TAG, "light sleep returned: %s", esp_err_to_name(sleep_err));
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+            if (gpio_get_level(PIN_BTN) == 0) {
+                wait_for_button_release();
                 screen_wake();
             }
-            prev = level;
-            vTaskDelay(pdMS_TO_TICKS(20));
+            prev = gpio_get_level(PIN_BTN);
+            continue;
+        }
+
+        ui_home_poll_charge_indicator(now_ms);
+
+        if (prev == 1 && level == 0) {
+            s_last_activity_ms = now_ms;
+            wait_for_button_release();
+            screen_sleep();
+            prev = gpio_get_level(PIN_BTN);
             continue;
         }
 
         touch_action_t touch_action = touch_home_action();
-        if (touch_action != TOUCH_ACTION_NONE || (prev == 1 && level == 0)) {
+        if (touch_action != TOUCH_ACTION_NONE) {
             s_last_activity_ms = now_ms;
         }
 
@@ -1911,19 +2146,16 @@ void app_main(void)
             if (s_screen_on) ui_show_home();
             s_last_activity_ms = esp_timer_get_time() / 1000;
         }
-        if ((prev == 1 && level == 0) || touch_action == TOUCH_ACTION_RECORD) {
+        if (touch_action == TOUCH_ACTION_RECORD) {
             vTaskDelay(pdMS_TO_TICKS(30));
-            if (touch_action == TOUCH_ACTION_RECORD || gpio_get_level(PIN_BTN) == 0) {
-                if (ready) {
-                    record_wav(next_index());
-                } else {
-                    ESP_LOGW(TAG, "not ready, ignoring press");
-                }
-                if (ready) ui_show_home();
-                else lcd_fill(C_MAGENTA);
-                while (gpio_get_level(PIN_BTN) == 0) vTaskDelay(pdMS_TO_TICKS(20));
-                s_last_activity_ms = esp_timer_get_time() / 1000;
+            if (ready) {
+                record_wav(next_index());
+            } else {
+                ESP_LOGW(TAG, "not ready, ignoring onscreen record tap");
             }
+            if (ready) ui_show_home();
+            else lcd_fill(C_MAGENTA);
+            s_last_activity_ms = esp_timer_get_time() / 1000;
         }
 
         /* Idle timeout: blank the LCD to prevent image retention and save power. */

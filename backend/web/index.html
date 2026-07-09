@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>WordSnap Hoth</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=20260708-3" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260709-3" />
   </head>
   <body>
     <main class="shell">
@@ -16,7 +16,7 @@
         <div class="metric-strip" aria-label="Dashboard metrics">
           <div class="metric">
             <span id="metric-total">00</span>
-            <label>clips</label>
+            <label>snips</label>
           </div>
           <div class="metric">
             <span id="metric-ready">00</span>
@@ -32,6 +32,11 @@
           </div>
         </div>
         <div class="toolbar-actions">
+          <label class="auto-sync" title="Auto-save new snips to Anki and sync to your phone">
+            <input type="checkbox" id="auto-sync-input" checked />
+            <span class="auto-sync-track" aria-hidden="true"><span class="auto-sync-thumb"></span></span>
+            <span class="auto-sync-text">Auto-sync</span>
+          </label>
           <button type="button" class="ghost-button" id="settings-open">Settings</button>
           <label class="file-button">
             Upload
@@ -41,11 +46,11 @@
         </div>
       </header>
 
-      <section class="review-board" aria-label="Clip review ledger">
+      <section class="review-board" aria-label="Snip review ledger">
         <div class="workbench">
-          <aside class="clip-queue" aria-label="Clip queue">
+          <aside class="clip-queue" aria-label="Snip queue">
             <div class="queue-head">
-              <span>clip</span>
+              <span>snip</span>
             </div>
             <div id="clip-queue-list" class="clip-queue-list" aria-live="polite"></div>
           </aside>
@@ -120,7 +125,7 @@
 
     <template id="queue-template">
       <div class="queue-row">
-        <button class="queue-play" type="button" aria-label="Play clip">
+        <button class="queue-play" type="button" aria-label="Play snip">
           <span class="queue-play-icon" aria-hidden="true"></span>
         </button>
         <button class="queue-item" type="button">
@@ -129,7 +134,7 @@
             <small class="queue-meta"></small>
           </span>
         </button>
-        <button class="queue-delete" type="button" aria-label="Delete clip">
+        <button class="queue-delete" type="button" aria-label="Delete snip">
           <span aria-hidden="true"></span>
         </button>
       </div>
@@ -139,7 +144,7 @@
       <article class="clip">
         <div class="clip-top">
           <div>
-            <p class="eyebrow">Selected clip</p>
+            <p class="eyebrow">Selected snip</p>
             <div class="clip-title"></div>
             <div class="clip-meta"></div>
           </div>
@@ -210,6 +215,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260709-1"></script>
+    <script src="/assets/app.js?v=20260709-3"></script>
   </body>
 </html>

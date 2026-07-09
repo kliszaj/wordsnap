@@ -59,6 +59,10 @@ class ProcessRequest(BaseModel):
     capture_timestamp: str | None = None
 
 
+class AutoSyncPatch(BaseModel):
+    enabled: bool
+
+
 class SettingsPatch(BaseModel):
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
@@ -94,12 +98,14 @@ def auto_process_clip(clip_id: str, capture_timestamp: str | None = None) -> Non
         update_clip(clip_id, {"status": "error", "error": f"{type(exc).__name__}: {exc}"})
         return
 
-    # Fully automatic: push the fresh card into Anki and sync to AnkiWeb (-> phone).
-    # Best-effort — if Anki is unreachable, leave the clip 'processed' so it can be retried.
-    try:
-        _persist_to_anki(clip_id)
-    except Exception as exc:
-        update_clip(clip_id, {"anki_sync_error": f"{type(exc).__name__}: {exc}"})
+    # Auto-sync (header toggle, ON by default): push the fresh card into Anki and
+    # sync to AnkiWeb (-> phone). Best-effort — if Anki is unreachable, leave the
+    # clip 'processed' so it can be retried, and skip entirely when the toggle is off.
+    if settings.auto_anki_enabled():
+        try:
+            _persist_to_anki(clip_id)
+        except Exception as exc:
+            update_clip(clip_id, {"anki_sync_error": f"{type(exc).__name__}: {exc}"})
 
 
 def _anki_tags(note: dict[str, Any]) -> list[str]:
@@ -256,6 +262,19 @@ def save_settings(patch: SettingsPatch) -> dict[str, Any]:
     data = settings.update_settings(updates)
     data["anki"]["connection"] = anki_connection_status()
     return data
+
+
+@app.get("/api/auto-sync")
+def get_auto_sync() -> dict[str, bool]:
+    """Whether new uploads auto-save to Anki and sync to the phone."""
+    settings.apply_to_env()
+    return {"enabled": settings.auto_anki_enabled()}
+
+
+@app.post("/api/auto-sync")
+def set_auto_sync(patch: AutoSyncPatch) -> dict[str, bool]:
+    settings.update_settings({"AUTO_ANKI": "1" if patch.enabled else "0"})
+    return {"enabled": settings.auto_anki_enabled()}
 
 
 @app.get("/api/clips")

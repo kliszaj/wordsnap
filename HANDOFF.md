@@ -13,7 +13,7 @@ Current deployment target: Hoth at `10.0.0.240`.
 | Piece | State |
 |---|---|
 | Device recording | Working on hardware |
-| SD organization | Clips live under `/sdcard/clips/`; root clips were auto-migrated |
+| SD organization | Recordings live under `/sdcard/clips/`; root recordings were auto-migrated |
 | Batch sync | Working; tap upload pill to upload all clips, progress bar turns green on clean sync |
 | Delete-on-ACK | Working; device deletes local WAV only after server 2xx ACK |
 | Empty/invalid WAV cleanup | Added in firmware and backend |
@@ -24,7 +24,7 @@ Current deployment target: Hoth at `10.0.0.240`.
 | Phrase/sentence cards | Added: Claude can produce word, phrase, or sentence cards |
 | Anki direct save | Working via AnkiConnect |
 | Phone Anki loop | Verified: card saved to Anki on Hoth and visible after Anki sync |
-| Docker | WordSnap compose/build files exist; Hoth runs Docker Compose |
+| Docker | WordSnap compose/build files exist; latest image pushed to Docker Hub |
 
 ---
 
@@ -199,10 +199,12 @@ Current firmware behavior:
 - Boots, mounts SD, initializes ES7210 audio.
 - Stores recordings in `/sdcard/clips/`.
 - Auto-migrates legacy root `rec_*.wav` files into `/sdcard/clips/`.
-- Home UI has upload pill and red record button.
+- Home UI has `SNAPS [n]` pill, red record button, and a bottom charging row when USB power is present.
+- Charging row shows amber bolt + `CHARGING NN%` while charging, green bolt + `NN%` after charge completes; both use the live AXP2101 gauge.
 - Touch red record button to record.
 - Tap recording screen to stop.
-- BOOT remains a fallback control.
+- BOOT is power-only: press while asleep to wake, press while awake to sleep.
+- BOOT does not start or stop recordings.
 - Max recording duration is capped.
 - Upload pill batch-syncs all valid clips.
 - Upload progress bar fills during sync and turns green on clean completion.
@@ -254,7 +256,7 @@ Important endpoints:
 Current web features:
 
 - Left clip list scrolls independently.
-- Delete clips from the side panel.
+- Delete snips from the side panel.
 - Audio playback for selected clip.
 - Correct transcript before translation.
 - Transcribe button under transcription step.
@@ -306,6 +308,13 @@ docker compose -f docker-compose.build.yml build
 docker push kliszaj/wordsnap:latest
 ```
 
+Latest pushed image from this checkpoint:
+
+```text
+kliszaj/wordsnap:latest
+sha256:719d7d27f7edcf62181a70ebc2208cc7d7efad446d76d9c63b3c1b8c9eb4e6c3
+```
+
 Local run:
 
 ```powershell
@@ -351,22 +360,64 @@ Completed in the follow-up pass after the live Anki test:
 - Settings now shows AnkiConnect status, deck presence, and last Anki save.
 - The checked-in Unraid compose includes the Anki desktop container on host port `3010`.
 
+### Recent Work (session 2026-07-09)
+
+**Backend / Web:**
+
+- **Auto-sync toggle** — backend + web. `AUTO_ANKI` flag (default ON) in `backend/settings.py`
+  (`auto_anki_enabled()`), gates the auto-save-to-Anki step in `auto_process_clip`, plus
+  `GET`/`POST /api/auto-sync`. Header toggle switch in `index.html`/`app.js`/`styles.css`, left of
+  Settings. Asset cache-buster is `?v=20260709-3`.
+
+**Device firmware:**
+
+- **Display tuning (firmware)** — ST7789 was washed out. Added the standard Waveshare
+  VCOM/power/gamma register block after `esp_lcd_panel_init` in `lcd_init()` (deeper blacks,
+  richer color). Knobs to tune further: `0xBB` VCOMS (→`0x28` for darker black), `0xC3` VRHS.
+  *Built + flashed + user-approved.*
+- **Screen transition fix (firmware)** — removed the ugly black interstitial on navigate/refresh.
+  Was blanking the backlight during a slow line-by-line repaint. Now: `ui_transition_begin/end`
+  are no-ops (repaint in place, backlight stays on) and `lcd_fill` paints 32-row strips
+  (~284 SPI transactions → ~9). *Built + flashed + user-approved.*
+- **Speaker removal** — the ES8311 playback path never drove the NS4150B amp correctly; hardware
+  speaker is being removed. All playback/codec code is gated behind `#define SPEAKER_ENABLED 0`
+  in `firmware/main/main.c` (globals, `audio_input_deinit`/`audio_output_init`/`audio_output_deinit`,
+  `preview_clip_index`, `ui_show_playback`, `ui_playback_update_levels`, `draw_play_icon`). The
+  per-clip **play button is removed** from the clips view (icon + touch region gated off; clip
+  label shifted left). Flip the macro to `1` to restore.
+- **Upload % animation (firmware)** — `ui_show_uploading` now tweens the big `N%` smoothly between
+  per-clip progress steps set by `upload_progress`, repainting only the number area.
+- **Event-driven idle + light sleep, button wake (firmware)** — PM is enabled in `sdkconfig` and
+  `sdkconfig.defaults`; `app_main` configures 160/40 MHz with auto light sleep. When the screen is
+  off, the main loop blocks in `esp_light_sleep_start()` and wakes from the BOOT button only
+  (`GPIO9` low-level wake). When the screen is on, BOOT puts the screen back to sleep instead of
+  acting as a recording shortcut. Touch wake while screen-off is intentionally disabled; touch remains
+  responsive while the screen is on. Deep sleep is intentionally not used because C6 deep-sleep GPIO
+  wake needs LP-GPIO 0–7, while the button is GPIO9 and touch INT is GPIO11.
+- **Device copy + charging state (firmware)** — on-device wording is now `SNAPS` / `SNAP` / `NO SNAP`.
+  Home charging UI is a bottom row, not a corner icon: amber bolt + live `CHARGING NN%` while charging,
+  green bolt + live `NN%` when USB power is present but charging is complete. The green is `#58A75D`.
+  Charging/done rows clear the full bottom strip before drawing to avoid overlap. *Built + flashed.*
+
+**Planned (not started):**
+
+- **Power verification** — measure idle current after screen-off, confirm instant button wake,
+  confirm recording still has no I2S glitches, and confirm WiFi upload still succeeds with PM on.
+- **Battery**: safe to connect a single-cell 3.7 V LiPo now — the AXP2101 PMIC charges it from USB
+  automatically and the firmware already reads its gauge. **Check JST polarity against the board
+  silkscreen first.** Real runtime needs the light-sleep work above.
+- **Rename `wordclip` → `wordsnap` and internal `clips` → `snips`/`snaps`** across the codebase (firmware project
+  name/binary, identifiers, API routes, SD `/sdcard/clips/` path + migration). Large,
+  cross-cutting; the device↔server contract (`/api/clips`, upload paths) and the on-card folder must
+  migrate together. Plan as its own pass.
+
 Recommended next order:
 
-1. Push/pull/restart the newest WordSnap Docker image on Hoth after each backend/UI deployment.
-2. Record a new device clip and run the full fresh path:
-   - record
-   - tap upload
-   - confirm auto-process
-   - save to Anki
-   - sync phone
-3. Continue device UI design states:
-   - idle/ready
-   - recording
-   - saved
-   - syncing
-   - sync complete
-   - sync error
+1. Measure/verify the new firmware power behavior, charging row, and upload animation on hardware.
+2. Pull/restart the newest WordSnap Docker image on Hoth if it has been pushed since this handoff.
+3. Record a new device snap and run the full fresh path: record → upload → auto-process → save →
+   phone sync.
+4. Plan and execute the `wordclip→wordsnap` / `clips→snaps` rename as a dedicated pass.
 
 ---
 

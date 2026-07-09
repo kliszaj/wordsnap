@@ -18,14 +18,17 @@ The firmware UI now follows the supplied 240x284 WordSnap device mocks.
 ## Current States
 
 - **Idle / main**
-  - `Clips [n]` pill centered near top.
-  - Shows `Clips [0]` when there are no pending clips.
+  - `Snaps [n]` pill centered near top.
+  - Shows `Snaps [0]` when there are no pending snaps.
   - Large red record button with dark ring.
-- **Clip menu**
-  - Top `Upload [n]` pill uploads all pending clips.
-  - Shows two full clip rows plus a partial third row so tap targets stay large.
+  - Bottom charging row appears only while USB power is present.
+  - Amber bolt + `CHARGING NN%` uses the live AXP2101 battery gauge while active charging.
+  - Green bolt + `NN%` uses the same live gauge when USB is present but charging has finished.
+- **Snip menu**
+  - Top `Upload [n]` pill uploads all pending snaps.
+  - Shows two full snap rows plus a partial third row so tap targets stay large.
   - Each visible row has a left play icon and a right red X icon.
-  - Red X removes the local SD-card clip immediately.
+  - Red X removes the local SD-card snap immediately.
   - Play previews the local WAV through the onboard ES8311 speaker codec.
   - Bottom row has up arrow, `Back`, and down arrow navigation.
 - **Playback**
@@ -36,11 +39,11 @@ The firmware UI now follows the supplied 240x284 WordSnap device mocks.
 - **Recording**
   - Large `00:SS` timer.
   - Level-bar motif on the lower left.
-  - Bottom rail with red `REC` status and clip number pill.
+  - Bottom rail with red `REC` status and snap number pill.
   - Timer redraws once per second.
 - **Done recording**
   - Keeps the elapsed timer on screen briefly.
-  - Bottom rail shows green `DONE` and clip number.
+  - Bottom rail shows green `DONE` and snap number.
 - **Wake battery overlay**
   - On wake from idle-off, shows battery for 2 seconds, then returns to idle.
   - Reads AXP2101 fuel gauge register `0xA4`; falls back to medium battery if unavailable.
@@ -61,22 +64,23 @@ The firmware UI now follows the supplied 240x284 WordSnap device mocks.
 
 - Tap the red record target to start recording.
 - Tap the recording screen to stop after the guard interval.
-- BOOT button remains a fallback for start/stop.
-- Tap `Clips [n]` to manage pending clips.
-- Tap `Upload [n]` inside the clip menu to batch sync only when pending clip count is greater than 0.
-- Tap clip-menu up/down arrows to page through local clips.
+- BOOT is power-only: press while asleep to wake; press while awake to sleep.
+- BOOT does not start or stop recordings.
+- Tap `Snaps [n]` to manage pending snaps.
+- Tap `Upload [n]` inside the snap menu to batch sync only when pending snap count is greater than 0.
+- Tap snap-menu up/down arrows to page through local snaps.
 - Buttons give immediate pressed feedback:
   - the home record button pulses before entering recording,
   - pills briefly invert,
-  - clip-menu play/delete/nav controls flash a small ring.
+  - snap-menu play/delete/nav controls flash a small ring.
 
 ## Upload Behavior
 
-- Clips are stored in `/sdcard/clips/`.
+- Snaps are stored in `/sdcard/clips/`.
 - Upload reads WiFi/server config from `/sdcard/wifi.txt`.
 - Default server is `http://10.0.0.240:8090`.
 - Upload is multipart `POST /api/upload`.
-- Local clip is deleted only after server 2xx ACK.
+- Local snap is deleted only after server 2xx ACK.
 - Invalid/empty WAVs are skipped and removed locally.
 
 ## Next Visual QA
