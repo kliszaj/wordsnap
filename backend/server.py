@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from anki_format import anki_note
+from anki_format import anki_note, front_with_article
 from compare import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_WHISPER_MODEL,
@@ -336,7 +336,7 @@ def patch_clip(clip_id: str, patch: ClipPatch) -> dict[str, Any]:
     clip = find_clip(clip_id)
     if {"card_front", "corrected_word", "swedish_definition", "english_definition"} & changes.keys():
         merged = {**clip, **changes}
-        front = merged.get("card_front") or merged.get("corrected_word")
+        front = front_with_article(merged.get("card_front") or merged.get("corrected_word"), merged.get("gender"))
         if front and merged.get("swedish_definition") and merged.get("english_definition"):
             merged_card = {
                 "front": front,
@@ -358,7 +358,7 @@ def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
     clip = find_clip(clip_id)
     note = clip.get("anki")
     if not note:
-        front = clip.get("card_front") or clip.get("corrected_word")
+        front = front_with_article(clip.get("card_front") or clip.get("corrected_word"), clip.get("gender"))
         if front and clip.get("swedish_definition") and clip.get("english_definition"):
             note = {
                 "front": front,

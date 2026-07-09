@@ -46,7 +46,6 @@
           <aside class="clip-queue" aria-label="Clip queue">
             <div class="queue-head">
               <span>clip</span>
-              <span>status</span>
             </div>
             <div id="clip-queue-list" class="clip-queue-list" aria-live="polite"></div>
           </aside>
@@ -121,15 +120,18 @@
 
     <template id="queue-template">
       <div class="queue-row">
+        <button class="queue-play" type="button" aria-label="Play clip">
+          <span class="queue-play-icon" aria-hidden="true"></span>
+        </button>
         <button class="queue-item" type="button">
-          <span class="queue-number"></span>
-          <span>
+          <span class="queue-copy">
             <strong class="queue-title"></strong>
             <small class="queue-meta"></small>
           </span>
-          <span class="status"></span>
         </button>
-        <button class="queue-delete" type="button" aria-label="Delete clip">Delete</button>
+        <button class="queue-delete" type="button" aria-label="Delete clip">
+          <span aria-hidden="true"></span>
+        </button>
       </div>
     </template>
 
@@ -208,6 +210,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260708-3"></script>
+    <script src="/assets/app.js?v=20260709-1"></script>
   </body>
 </html>

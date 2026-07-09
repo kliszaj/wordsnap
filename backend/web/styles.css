@@ -9,10 +9,10 @@
   --text: #ebe8df;
   --muted: #9b978d;
   --muted-2: #706d66;
-  --accent: #ff533b;
+  --accent: #FF4D4D;
   --accent-dark: #8f2d24;
   --good: #76c69a;
-  --warning: #e7b95f;
+  --warning: #FF4D4D;
   --mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", monospace;
   --sans: "Geist", "Satoshi", "Segoe UI", system-ui, sans-serif;
   font-family: var(--sans);
@@ -70,7 +70,7 @@ button,
 button:hover,
 .file-button:hover,
 .ghost-button:hover {
-  border-color: rgba(255, 83, 59, 0.64);
+  border-color: rgba(255, 77, 77, 0.64);
 }
 
 button:focus-visible,
@@ -202,7 +202,7 @@ h2 {
 
 .workbench {
   display: grid;
-  grid-template-columns: 310px minmax(0, 1fr);
+  grid-template-columns: 380px minmax(0, 1fr);
   height: calc(100dvh - 150px);
   min-height: 520px;
   overflow: hidden;
@@ -224,9 +224,7 @@ h2 {
 
 .queue-head {
   display: grid;
-  grid-template-columns: 1fr auto;
-  gap: 10px;
-  padding: 13px 14px;
+  padding: 13px 18px;
   border-bottom: 1px solid var(--line);
   color: var(--muted);
   font-family: var(--mono);
@@ -245,17 +243,29 @@ h2 {
 
 .queue-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: 42px minmax(0, 1fr) 34px;
+  gap: 12px;
+  align-items: center;
+  min-height: 78px;
+  padding: 0 16px 0 18px;
   border-bottom: 1px solid var(--line);
+  transition:
+    background 160ms ease,
+    box-shadow 160ms ease;
+}
+
+.queue-row.active {
+  background: rgba(255, 77, 77, 0.09);
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 
 .queue-item {
-  display: grid;
-  grid-template-columns: 48px minmax(0, 1fr) auto;
-  gap: 10px;
+  display: block;
   align-items: center;
   width: 100%;
-  min-height: 72px;
+  min-width: 0;
+  min-height: 78px;
+  padding: 0;
   border: 0;
   border-radius: 0;
   background: transparent;
@@ -264,21 +274,58 @@ h2 {
 }
 
 .queue-item.active {
-  background: var(--accent);
-  color: #190503;
+  background: transparent;
+  color: var(--text);
 }
 
-.queue-item.active .queue-meta,
-.queue-item.active .status,
-.queue-item.active .queue-number {
-  color: #190503;
+.queue-copy {
+  display: block;
+  min-width: 0;
 }
 
-.queue-number {
-  color: var(--accent);
-  font-family: var(--mono);
-  font-size: 18px;
-  font-variant-numeric: tabular-nums;
+.queue-play {
+  --progress: 0deg;
+  position: relative;
+  display: grid;
+  place-items: center;
+  width: 36px;
+  min-width: 36px;
+  height: 36px;
+  min-height: 36px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background:
+    conic-gradient(var(--accent) var(--progress), rgba(235, 232, 223, 0.18) 0),
+    rgba(9, 10, 11, 0.6);
+}
+
+.queue-play::before {
+  content: "";
+  position: absolute;
+  inset: 4px;
+  border-radius: inherit;
+  background: var(--bg);
+}
+
+.queue-play-icon {
+  position: relative;
+  z-index: 1;
+  width: 0;
+  height: 0;
+  margin-left: 2px;
+  border-top: 6px solid transparent;
+  border-bottom: 6px solid transparent;
+  border-left: 9px solid var(--text);
+}
+
+.queue-play.playing .queue-play-icon {
+  width: 11px;
+  height: 12px;
+  margin-left: 0;
+  border: 0;
+  background:
+    linear-gradient(90deg, var(--text) 0 4px, transparent 4px 7px, var(--text) 7px 11px);
 }
 
 .queue-title {
@@ -286,33 +333,61 @@ h2 {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  padding-top: 17px;
 }
 
 .queue-delete {
-  width: 58px;
-  min-height: 72px;
+  position: relative;
+  width: 30px;
+  min-width: 30px;
+  height: 30px;
+  min-height: 30px;
+  padding: 0;
   border: 0;
-  border-left: 1px solid var(--line);
-  border-radius: 0;
-  background: rgba(9, 10, 11, 0.28);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 10px;
-  letter-spacing: 0.08em;
-  text-transform: uppercase;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.queue-row.active .queue-delete {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.queue-delete span::before,
+.queue-delete span::after {
+  content: "";
+  position: absolute;
+  top: 14px;
+  left: 8px;
+  width: 14px;
+  height: 2px;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.queue-delete span::before {
+  transform: rotate(45deg);
+}
+
+.queue-delete span::after {
+  transform: rotate(-45deg);
 }
 
 .queue-delete:hover {
   color: var(--accent);
-  background: rgba(255, 83, 59, 0.08);
+  background: rgba(255, 77, 77, 0.08);
 }
 
 .queue-meta {
   display: block;
-  margin-top: 3px;
-  color: var(--muted);
+  margin-top: 5px;
+  color: var(--accent);
   font-family: var(--mono);
   font-size: 11px;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
 }
 
@@ -426,9 +501,9 @@ h2 {
   top: 208px;
   height: 8px;
   border-radius: 999px;
-  background: rgba(255, 83, 59, 0.82);
+  background: rgba(255, 77, 77, 0.82);
   transform: translateY(-50%);
-  box-shadow: 0 0 26px rgba(255, 83, 59, 0.16);
+  box-shadow: 0 0 26px rgba(255, 77, 77, 0.16);
 }
 
 .tape-card {

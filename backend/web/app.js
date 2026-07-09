@@ -6,6 +6,8 @@ const fileInput = document.querySelector("#file-input");
 
 let clips = [];
 let selectedClipId = null;
+const queueAudio = new Audio();
+let playingClipId = null;
 
 function statusClass(status) {
   if (status === "approved") return "status approved";
@@ -103,6 +105,35 @@ function selectedClipIndex() {
   return clips.findIndex((clip) => clip.id === selectedClipId);
 }
 
+function setQueuePlaybackState() {
+  document.querySelectorAll(".queue-row").forEach((row) => {
+    const isPlayingRow = row.dataset.clipId === playingClipId && !queueAudio.paused;
+    const progress = row.dataset.clipId === playingClipId && queueAudio.duration
+      ? Math.min(1, queueAudio.currentTime / queueAudio.duration)
+      : 0;
+    const play = row.querySelector(".queue-play");
+    play?.classList.toggle("playing", isPlayingRow);
+    play?.style.setProperty("--progress", `${progress * 360}deg`);
+    play?.setAttribute("aria-label", isPlayingRow ? "Pause clip" : "Play clip");
+  });
+}
+
+async function toggleQueuePlayback(clip) {
+  if (playingClipId === clip.id && !queueAudio.paused) {
+    queueAudio.pause();
+    setQueuePlaybackState();
+    return;
+  }
+  document.querySelectorAll(".audio").forEach((audio) => audio.pause());
+  if (playingClipId !== clip.id) {
+    playingClipId = clip.id;
+    queueAudio.src = `/api/clips/${clip.id}/audio`;
+    queueAudio.currentTime = 0;
+  }
+  await queueAudio.play();
+  setQueuePlaybackState();
+}
+
 async function toggleSelectedClipSaved() {
   const clip = clips.find((item) => item.id === selectedClipId);
   if (!clip || clip.status === "exported") return;
@@ -122,26 +153,40 @@ function renderQueue() {
 
   clips.forEach((clip, index) => {
     const node = queueTemplate.content.firstElementChild.cloneNode(true);
+    node.dataset.clipId = clip.id;
     const item = node.querySelector(".queue-item");
+    node.classList.toggle("active", clip.id === selectedClipId);
     item.classList.toggle("active", clip.id === selectedClipId);
-    node.querySelector(".queue-number").textContent = clipNumber(clip, index);
     node.querySelector(".queue-title").textContent = clipFront(clip);
-    node.querySelector(".queue-meta").textContent = clip.iso_week || "unsorted";
-    const status = node.querySelector(".status");
-    status.className = statusClass(clip.status);
-    status.textContent = statusLabel(clip.status);
+    node.querySelector(".queue-meta").textContent = `CLIP ${clipNumber(clip, index)}`;
+    const playButton = node.querySelector(".queue-play");
+    playButton.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      selectedClipId = clip.id;
+      render();
+      try {
+        await toggleQueuePlayback(clip);
+      } catch (error) {
+        console.error("Could not play clip", error);
+      }
+    });
     item.addEventListener("click", () => {
       selectedClipId = clip.id;
       render();
     });
-    node.querySelector(".queue-delete").addEventListener("click", async () => {
-      if (!confirm(`Delete ${clip.original_name}?`)) return;
+    node.querySelector(".queue-delete").addEventListener("click", async (event) => {
+      event.stopPropagation();
+      if (playingClipId === clip.id) {
+        queueAudio.pause();
+        playingClipId = null;
+      }
       await request(`/api/clips/${clip.id}`, { method: "DELETE" });
       if (selectedClipId === clip.id) selectedClipId = null;
       await loadClips();
     });
     queueList.append(node);
   });
+  setQueuePlaybackState();
 }
 
 function renderDetail() {
@@ -161,7 +206,9 @@ function renderDetail() {
   const status = node.querySelector(".status");
   status.className = statusClass(clip.status);
   status.textContent = statusLabel(clip.status);
-  node.querySelector(".audio").src = `/api/clips/${clip.id}/audio`;
+  const detailAudio = node.querySelector(".audio");
+  detailAudio.src = `/api/clips/${clip.id}/audio`;
+  detailAudio.addEventListener("play", () => queueAudio.pause());
 
   const transcript = node.querySelector(".transcript");
   const cardFront = node.querySelector(".card-front") || node.querySelector(".corrected-word");
@@ -219,6 +266,14 @@ function render() {
   renderQueue();
   renderDetail();
 }
+
+queueAudio.addEventListener("timeupdate", setQueuePlaybackState);
+queueAudio.addEventListener("play", setQueuePlaybackState);
+queueAudio.addEventListener("pause", setQueuePlaybackState);
+queueAudio.addEventListener("ended", () => {
+  queueAudio.currentTime = 0;
+  setQueuePlaybackState();
+});
 
 fileInput.addEventListener("change", async () => {
   for (const file of fileInput.files) {

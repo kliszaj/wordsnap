@@ -19,12 +19,14 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <stdlib.h>
 #include <time.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/spi_common.h"
+#include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
 #include "driver/i2c_master.h"
 #include "esp_lcd_panel_io.h"
@@ -46,6 +48,7 @@
 #include "esp_http_client.h"
 #include "freertos/event_groups.h"
 #include "format_wav.h"
+#include "ui_font.h"
 
 static const char *TAG = "wordclip";
 
@@ -61,6 +64,7 @@ static const char *TAG = "wordclip";
 #define PIN_BTN     9          /* BOOT button, active-low */
 #define PIN_TOUCH_INT 11
 #define PIN_TOUCH_RST -1       /* Waveshare example leaves CST816 reset unmanaged; GPIO4 is LCD reset */
+#define AXP2101_ADDR 0x34
 
 #define LCD_HOST    SPI2_HOST
 #define LCD_H_RES   240
@@ -76,6 +80,7 @@ static const char *TAG = "wordclip";
 #define PIN_I2S_BCLK    20
 #define PIN_I2S_WS      22
 #define PIN_I2S_DIN     21
+#define PIN_I2S_DOUT    23
 
 #define SAMPLE_RATE     16000                 /* Whisper-native */
 #define SAMPLE_BITS     I2S_DATA_BIT_WIDTH_16BIT
@@ -85,42 +90,64 @@ static const char *TAG = "wordclip";
 #define MAX_RECORD_SECONDS 15
 #define MIN_RECORD_MS      600
 #define SCREEN_IDLE_MS     30000       /* blank the LCD after this idle time (retention + power) */
+#define WAKE_BATTERY_MS     2000
 
 /* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
 #define C_WHITE   0xFFFF
-#define C_RED     0xF800
+#define C_RED     0xFA69   /* #FF4D4D in RGB565 */
 #define C_GREEN   0x07E0
+#define C_AMBER   0xDD65
 #define C_MAGENTA 0xF81F
-#define C_CHARCOAL 0x2124
+#define C_BG       0x1082
 #define C_PANEL    0x18E3
-#define C_MUTED    0xA534
+#define C_TEXT     0xBDBD
+#define C_MUTED    0xA514
 #define C_DOT      0x39E7
 #define C_DARK_RED 0xA145
 #define C_BLACK    0x0000
 #define C_BLUE     0x001F
+#define C_LINE     0x31A6
+#define C_RING     0x0861
+#define C_DISABLED 0x5AEB
+#define C_CHARCOAL C_BG
 
 static esp_lcd_panel_handle_t s_panel = NULL;
 static esp_lcd_panel_io_handle_t s_touch_io = NULL;
 static esp_lcd_touch_handle_t s_touch = NULL;
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
+static i2c_master_dev_handle_t s_axp = NULL;
 static bool s_sd_ok = false;
 static i2s_chan_handle_t s_i2s_rx = NULL;
+static i2s_chan_handle_t s_i2s_tx = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
+static esp_codec_dev_handle_t s_play_codec = NULL;
+static const audio_codec_ctrl_if_t *s_rec_ctrl_if = NULL;
+static const audio_codec_data_if_t *s_rec_data_if = NULL;
+static const audio_codec_if_t *s_rec_codec_if = NULL;
+static const audio_codec_ctrl_if_t *s_play_ctrl_if = NULL;
+static const audio_codec_data_if_t *s_play_data_if = NULL;
+static const audio_codec_gpio_if_t *s_play_gpio_if = NULL;
+static const audio_codec_if_t *s_play_codec_if = NULL;
 static int s_active_clip_index = 0;
 static bool s_recording_active = false;
 static bool s_touch_was_down = false;
 static bool s_screen_on = true;
 static int64_t s_last_activity_ms = 0;
+static char s_timer_prev[6] = "";
+static int s_wave_x = 0;
+static int s_upload_prev_pct = -1;
+static bool s_upload_prev_done = false;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
 static int next_index(void);
 static int pending_clip_count(void);
+static bool parse_clip_index(const char *name, int *index);
 
 typedef enum {
     TOUCH_ACTION_NONE = 0,
     TOUCH_ACTION_RECORD,
-    TOUCH_ACTION_UPLOAD,
+    TOUCH_ACTION_CLIPS,
 } touch_action_t;
 
 /* ---------------- LCD ---------------- */
@@ -132,6 +159,25 @@ static void lcd_fill(uint16_t color)
     for (int y = 0; y < LCD_V_RES; y++) {
         esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, line);
     }
+}
+
+static void ui_transition_begin(void)
+{
+    if (s_screen_on) gpio_set_level(PIN_LCD_BL, 0);
+}
+
+static void ui_transition_end(void)
+{
+    if (s_screen_on) {
+        gpio_set_level(PIN_LCD_BL, 1);
+        vTaskDelay(pdMS_TO_TICKS(12));
+    }
+}
+
+static void ui_transition_fill(uint16_t color)
+{
+    ui_transition_begin();
+    lcd_fill(color);
 }
 
 static void lcd_rect(int x0, int y0, int x1, int y1, uint16_t color)
@@ -170,48 +216,550 @@ static void lcd_disc(int cx, int cy, int r, uint16_t color)
     }
 }
 
+static void lcd_circle_outline(int cx, int cy, int r, int thickness, uint16_t color)
+{
+    lcd_disc(cx, cy, r, color);
+    lcd_disc(cx, cy, r - thickness, C_BG);
+}
+
+static void lcd_round_rect_fill(int x, int y, int w, int h, int r, uint16_t color)
+{
+    lcd_rect(x + r, y, x + w - r, y + h, color);
+    lcd_rect(x, y + r, x + w, y + h - r, color);
+    lcd_disc(x + r, y + r, r, color);
+    lcd_disc(x + w - r - 1, y + r, r, color);
+    lcd_disc(x + r, y + h - r - 1, r, color);
+    lcd_disc(x + w - r - 1, y + h - r - 1, r, color);
+}
+
+static void lcd_round_rect_outline(int x, int y, int w, int h, int r, int thickness, uint16_t color, uint16_t fill)
+{
+    lcd_round_rect_fill(x, y, w, h, r, color);
+    lcd_round_rect_fill(x + thickness, y + thickness, w - 2 * thickness, h - 2 * thickness,
+                        r - thickness, fill);
+}
+
+static void lcd_line(int x0, int y0, int x1, int y1, int thickness, uint16_t color)
+{
+    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
+    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+    while (1) {
+        lcd_disc(x0, y0, thickness / 2, color);
+        if (x0 == x1 && y0 == y1) break;
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+    }
+}
+
+static uint8_t glyph_row(char ch, int row)
+{
+    static const uint8_t blank[7] = {0,0,0,0,0,0,0};
+    const uint8_t *g = blank;
+    static const uint8_t A[7]={14,17,17,31,17,17,17}, C[7]={14,17,16,16,16,17,14};
+    static const uint8_t D[7]={30,17,17,17,17,17,30}, E[7]={31,16,16,30,16,16,31};
+    static const uint8_t F[7]={31,16,16,30,16,16,16};
+    static const uint8_t G[7]={14,17,16,23,17,17,15}, I[7]={14,4,4,4,4,4,14};
+    static const uint8_t L[7]={16,16,16,16,16,16,31}, N[7]={17,25,21,19,17,17,17};
+    static const uint8_t O[7]={14,17,17,17,17,17,14}, P[7]={30,17,17,30,16,16,16};
+    static const uint8_t R[7]={30,17,17,30,20,18,17}, S[7]={15,16,16,14,1,1,30};
+    static const uint8_t T[7]={31,4,4,4,4,4,4}, U[7]={17,17,17,17,17,17,14};
+    static const uint8_t V[7]={17,17,17,17,17,10,4}, W[7]={17,17,17,21,21,21,10};
+    static const uint8_t zero[7]={14,17,19,21,25,17,14}, one[7]={4,12,4,4,4,4,14};
+    static const uint8_t two[7]={14,17,1,2,4,8,31}, three[7]={30,1,1,14,1,1,30};
+    static const uint8_t four[7]={2,6,10,18,31,2,2}, five[7]={31,16,16,30,1,1,30};
+    static const uint8_t six[7]={14,16,16,30,17,17,14}, seven[7]={31,1,2,4,8,8,8};
+    static const uint8_t eight[7]={14,17,17,14,17,17,14}, nine[7]={14,17,17,15,1,1,14};
+    static const uint8_t dot[7]={0,0,0,0,0,12,12}, dash[7]={0,0,0,31,0,0,0};
+    static const uint8_t lbr[7]={14,8,8,8,8,8,14}, rbr[7]={14,2,2,2,2,2,14};
+    switch (ch) {
+    case 'A': g=A; break; case 'C': g=C; break; case 'D': g=D; break; case 'E': g=E; break;
+    case 'F': g=F; break; case 'G': g=G; break; case 'I': g=I; break; case 'L': g=L; break; case 'N': g=N; break;
+    case 'O': g=O; break; case 'P': g=P; break; case 'R': g=R; break; case 'S': g=S; break;
+    case 'T': g=T; break; case 'U': g=U; break; case 'V': g=V; break; case 'W': g=W; break;
+    case '0': g=zero; break; case '1': g=one; break; case '2': g=two; break; case '3': g=three; break;
+    case '4': g=four; break; case '5': g=five; break; case '6': g=six; break; case '7': g=seven; break;
+    case '8': g=eight; break; case '9': g=nine; break; case '.': g=dot; break; case '-': g=dash; break;
+    case '[': g=lbr; break; case ']': g=rbr; break;
+    }
+    return g[row];
+}
+
+static void draw_text(int x, int y, const char *s, int scale, uint16_t color)
+{
+    for (const char *p = s; *p; p++, x += 6 * scale) {
+        if (*p == ' ') continue;
+        for (int row = 0; row < 7; row++) {
+            uint8_t bits = glyph_row(*p, row);
+            for (int col = 0; col < 5; col++) {
+                if (bits & (1 << (4 - col))) {
+                    lcd_rect(x + col * scale, y + row * scale,
+                             x + (col + 1) * scale, y + (row + 1) * scale, color);
+                }
+            }
+        }
+    }
+}
+
+static const ui_glyph_t *font_lookup(const ui_glyph_t *glyphs, int count, char ch)
+{
+    for (int i = 0; i < count; i++) {
+        if (glyphs[i].ch == ch) return &glyphs[i];
+    }
+    return NULL;
+}
+
+static int font_text_width(const ui_glyph_t *glyphs, int count, const char *s)
+{
+    int width = 0;
+    for (const char *p = s; *p; p++) {
+        const ui_glyph_t *g = font_lookup(glyphs, count, *p);
+        if (g) width += g->advance;
+    }
+    return width;
+}
+
+static void draw_font_text(const ui_glyph_t *glyphs, int count, const uint8_t *bitmap,
+                           int x, int y, const char *s, uint16_t color)
+{
+    for (const char *p = s; *p; p++) {
+        const ui_glyph_t *g = font_lookup(glyphs, count, *p);
+        if (!g) continue;
+        int row_bytes = (g->w + 7) / 8;
+        for (int yy = 0; yy < g->h; yy++) {
+            for (int xx = 0; xx < g->w; xx++) {
+                uint8_t byte = bitmap[g->offset + yy * row_bytes + xx / 8];
+                if (byte & (1 << (7 - (xx % 8)))) {
+                    lcd_rect(x + xx + g->xoff, y + yy + g->yoff,
+                             x + xx + g->xoff + 1, y + yy + g->yoff + 1, color);
+                }
+            }
+        }
+        x += g->advance;
+    }
+}
+
+static int label_width(const char *s)
+{
+    return font_text_width(ui_label_glyphs, UI_LABEL_GLYPH_COUNT, s);
+}
+
+static void draw_label_text(int x, int y, const char *s, uint16_t color)
+{
+    draw_font_text(ui_label_glyphs, UI_LABEL_GLYPH_COUNT, ui_label_bitmap, x, y, s, color);
+}
+
+static int big_width(const char *s)
+{
+    return font_text_width(ui_big_glyphs, UI_BIG_GLYPH_COUNT, s);
+}
+
+static void draw_big_text(int x, int y, const char *s, uint16_t color)
+{
+    draw_font_text(ui_big_glyphs, UI_BIG_GLYPH_COUNT, ui_big_bitmap, x, y, s, color);
+}
+
+static void draw_big_char_centered(int x, int y, int w, char ch, uint16_t color)
+{
+    char text[2] = {ch, '\0'};
+    const ui_glyph_t *g = font_lookup(ui_big_glyphs, UI_BIG_GLYPH_COUNT, ch);
+    int dx = g ? (w - g->w) / 2 : 0;
+    draw_big_text(x + dx, y, text, color);
+}
+
+static void draw_status(int y, uint16_t dot_color, const char *label)
+{
+    lcd_rect(0, y - 8, 170, y + 24, C_BG);
+    lcd_disc(27, y + 7, 6, dot_color);
+    draw_label_text(38, y - 2, label, C_TEXT);
+}
+
+static void draw_clip_pill(int clip_index)
+{
+    char buf[4];
+    snprintf(buf, sizeof(buf), "%02d", clip_index % 100);
+    lcd_round_rect_fill(174, 228, 44, 28, 14, C_TEXT);
+    draw_label_text(190, 235, buf, C_BG);
+}
+
+static void format_time_value(uint32_t elapsed_ms, char out[6])
+{
+    uint32_t total = elapsed_ms / 1000;
+    int mm = total / 60;
+    int ss = total % 60;
+    if (mm > 99) mm = 99;
+    snprintf(out, 6, "%02d:%02d", mm, ss);
+}
+
+static void draw_face(void)
+{
+    draw_text(45, 122, "O", 5, C_TEXT);
+    draw_text(166, 122, "O", 5, C_TEXT);
+    lcd_line(62, 113, 70, 131, 3, C_TEXT);
+    lcd_line(185, 113, 177, 131, 3, C_TEXT);
+    lcd_rect(106, 164, 135, 167, C_TEXT);
+}
+
+static void draw_pill_button(int y, const char *label, bool enabled)
+{
+    int w = label_width(label) + 36;
+    int x = (LCD_H_RES - w) / 2;
+    uint16_t color = enabled ? C_TEXT : C_DISABLED;
+    lcd_round_rect_outline(x, y, w, 38, 19, 1, color, C_BG);
+    draw_label_text(x + 18, y + 11, label, color);
+}
+
+static void draw_pill_pressed(int y, const char *label)
+{
+    int w = label_width(label) + 36;
+    int x = (LCD_H_RES - w) / 2;
+    lcd_round_rect_fill(x, y, w, 38, 19, C_TEXT);
+    draw_label_text(x + 18, y + 11, label, C_BG);
+    vTaskDelay(pdMS_TO_TICKS(45));
+}
+
+static void draw_clips_pill(int pending)
+{
+    char label[20];
+    snprintf(label, sizeof(label), "CLIPS [%d]", pending);
+    draw_pill_button(32, label, true);
+}
+
+static void draw_clips_pill_pressed(int pending)
+{
+    char label[20];
+    snprintf(label, sizeof(label), "CLIPS [%d]", pending);
+    draw_pill_pressed(32, label);
+}
+
+static void draw_upload_pill(int pending)
+{
+    char label[20];
+    snprintf(label, sizeof(label), "UPLOAD [%d]", pending);
+    draw_pill_button(22, label, pending > 0);
+}
+
+static void draw_upload_pill_pressed(int pending)
+{
+    char label[20];
+    snprintf(label, sizeof(label), "UPLOAD [%d]", pending);
+    draw_pill_pressed(22, label);
+}
+
+static void ui_show_battery(int pct)
+{
+    ui_transition_fill(C_BG);
+    int x = 60, y = 114, w = 120, h = 62;
+    lcd_round_rect_outline(x, y, w, h, 16, 3, C_TEXT, C_BG);
+    lcd_round_rect_fill(x + w + 4, y + 22, 7, 18, 2, C_TEXT);
+    int fill_w = pct <= 20 ? 16 : 38;
+    uint16_t fill = pct <= 20 ? C_RED : C_AMBER;
+    lcd_round_rect_fill(x + 5, y + 5, fill_w, h - 10, 11, fill);
+    ui_transition_end();
+}
+
+static int battery_percent(void)
+{
+    if (!s_i2c_bus) return 50;
+    if (!s_axp) {
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = AXP2101_ADDR,
+            .scl_speed_hz = 400000,
+        };
+        if (i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) != ESP_OK) return 50;
+    }
+    uint8_t reg = 0xA4, pct = 0;
+    if (i2c_master_transmit_receive(s_axp, &reg, 1, &pct, 1, 100) != ESP_OK) return 50;
+    if (pct > 100) return 50;
+    return pct;
+}
+
+static bool axp_vbus_good(void)
+{
+    if (!s_i2c_bus) return true;
+    if (!s_axp) {
+        i2c_device_config_t cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = AXP2101_ADDR,
+            .scl_speed_hz = 400000,
+        };
+        if (i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) != ESP_OK) return true;
+    }
+    uint8_t reg = 0x00, status = 0;
+    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return true;
+    return (status & (1 << 5)) != 0;  /* AXP2101 reg00H[5] = VBUS_GOOD */
+}
+
 static void ui_show_home(void)
 {
-    lcd_fill(C_CHARCOAL);
-    /* Upload pill. Text rendering moves to LVGL; this shape reserves the touch target. */
-    lcd_rect(52, 32, 188, 78, C_PANEL);
-    lcd_disc(52, 55, 23, C_PANEL);
-    lcd_disc(188, 55, 23, C_PANEL);
-
-    /* Large record target from the mockup. */
-    lcd_disc(120, 178, 63, C_DARK_RED);
-    lcd_disc(120, 178, 58, C_RED);
+    ui_transition_fill(C_BG);
+    draw_clips_pill(pending_clip_count());
+    lcd_disc(120, 180, 67, C_RING);
+    lcd_circle_outline(120, 180, 59, 3, C_PANEL);
+    lcd_disc(120, 180, 47, C_RED);
+    ui_transition_end();
 
     ESP_LOGI(TAG, "UI home: pending=%d", pending_clip_count());
 }
 
-static void ui_show_recording(uint32_t elapsed_ms)
+static void ui_home_record_pressed(void)
 {
-    static uint16_t row[LCD_H_RES];
-    uint16_t bg = sw16(C_CHARCOAL), dot = sw16(C_DOT), muted = sw16(C_MUTED);
-    for (int y = 0; y < LCD_V_RES; y++) {
-        for (int x = 0; x < LCD_H_RES; x++) {
-            bool is_dot = ((x % 16) == 0) && ((y % 16) == 0);
-            row[x] = is_dot ? dot : bg;
-        }
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + 1, row);
+    lcd_disc(120, 180, 67, C_RING);
+    lcd_circle_outline(120, 180, 59, 3, C_PANEL);
+    lcd_disc(120, 180, 42, C_RED);
+    vTaskDelay(pdMS_TO_TICKS(35));
+    lcd_disc(120, 180, 50, C_RED);
+    vTaskDelay(pdMS_TO_TICKS(25));
+}
+
+static void draw_play_icon(int cx, int cy, uint16_t color)
+{
+    for (int row = -10; row <= 10; row++) {
+        int half = 10 - abs(row);
+        lcd_line(cx - 5, cy + row, cx - 5 + half, cy + row, 1, color);
+    }
+}
+
+static void draw_x_icon(int cx, int cy, uint16_t color)
+{
+    lcd_line(cx - 7, cy - 7, cx + 7, cy + 7, 3, color);
+    lcd_line(cx + 7, cy - 7, cx - 7, cy + 7, 3, color);
+}
+
+static void draw_icon_press_flash(int cx, int cy, bool destructive)
+{
+    uint16_t color = destructive ? C_RED : C_TEXT;
+    lcd_circle_outline(cx, cy, 18, 2, color);
+    vTaskDelay(pdMS_TO_TICKS(35));
+}
+
+static void draw_up_icon(int cx, int cy, uint16_t color)
+{
+    lcd_line(cx - 8, cy + 5, cx, cy - 5, 3, color);
+    lcd_line(cx, cy - 5, cx + 8, cy + 5, 3, color);
+}
+
+static void draw_down_icon(int cx, int cy, uint16_t color)
+{
+    lcd_line(cx - 8, cy - 5, cx, cy + 5, 3, color);
+    lcd_line(cx, cy + 5, cx + 8, cy - 5, 3, color);
+}
+
+static void draw_icon_button(int x, int y, int w, int h, bool enabled, bool down)
+{
+    uint16_t color = enabled ? C_TEXT : C_DISABLED;
+    lcd_round_rect_outline(x, y, w, h, h / 2, 1, color, C_BG);
+    if (down) draw_down_icon(x + w / 2, y + h / 2, color);
+    else draw_up_icon(x + w / 2, y + h / 2, color);
+}
+
+static void draw_back_button(void)
+{
+    const char *label = "BACK";
+    int x = 78, y = 250, w = 84, h = 30;
+    lcd_round_rect_outline(x, y, w, h, h / 2, 1, C_TEXT, C_BG);
+    draw_label_text(x + (w - label_width(label)) / 2, y + 7, label, C_TEXT);
+}
+
+static void ui_show_clip_menu(const int *indices, int visible, int total, int offset)
+{
+    ui_transition_fill(C_BG);
+    draw_upload_pill(total);
+
+    if (total == 0) {
+        draw_label_text((LCD_H_RES - label_width("NO CLIPS")) / 2, 132, "NO CLIPS", C_DISABLED);
     }
 
-    /* REC dot and clip-index pill; timer text comes with the LVGL pass. */
-    lcd_disc(38, 236, 7, C_RED);
-    lcd_rect(182, 226, 226, 258, muted);
-    lcd_disc(182, 242, 16, muted);
-    lcd_disc(226, 242, 16, muted);
+    for (int i = 0; i < visible; i++) {
+        int y = 70 + i * 64;
+        char label[16];
+        snprintf(label, sizeof(label), "CLIP %03d", indices[i]);
+        lcd_rect(18, y + 58, 222, y + 59, C_LINE);
+        draw_play_icon(33, y + 29, C_TEXT);
+        draw_label_text(58, y + 22, label, C_TEXT);
+        draw_x_icon(210, y + 29, C_RED);
+    }
+
+    bool can_up = offset > 0;
+    bool can_down = offset + visible < total;
+    draw_icon_button(20, 250, 44, 30, can_up, false);
+    draw_back_button();
+    draw_icon_button(176, 250, 44, 30, can_down, true);
+    ui_transition_end();
+}
+
+static void ui_recording_enter_animation(void)
+{
+    const int cx = 120;
+    const int cy = 180;
+    const int radii[] = {51, 59, 68};
+
+    for (int i = 0; i < 3; i++) {
+        lcd_circle_outline(cx, cy, radii[i], 3, C_RED);
+        vTaskDelay(pdMS_TO_TICKS(22));
+    }
+
+    /* A fast scanline wipe turns the idle record button into the recording screen. */
+    for (int y = 0; y < LCD_V_RES; y += 18) {
+        lcd_rect(0, y, LCD_H_RES, y + 18, C_BG);
+        if (y >= 180) lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
+        vTaskDelay(pdMS_TO_TICKS(4));
+    }
+
+    for (int x = 0; x <= LCD_H_RES / 2; x += 30) {
+        lcd_rect(LCD_H_RES / 2 - x, 198, LCD_H_RES / 2 + x, 200, C_LINE);
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+static void ui_recording_draw_static(bool clear_screen)
+{
+    if (clear_screen) lcd_fill(C_BG);
+    lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
+    draw_status(231, C_RED, "REC");
+    draw_clip_pill(s_active_clip_index);
+}
+
+static void ui_recording_update_time(uint32_t elapsed_ms)
+{
+    static const int x[5] = {15, 59, 103, 121, 165};
+    static const int w[5] = {42, 42, 18, 42, 42};
+    char now[6];
+    format_time_value(elapsed_ms, now);
+
+    for (int i = 0; i < 5; i++) {
+        if (s_timer_prev[0] != '\0' && s_timer_prev[i] == now[i]) continue;
+        lcd_rect(x[i] - 2, 24, x[i] + w[i] + 2, 112, C_BG);
+        draw_big_char_centered(x[i], 33, w[i], now[i], C_TEXT);
+    }
+    memcpy(s_timer_prev, now, sizeof(s_timer_prev));
+}
+
+static void ui_recording_update_levels(uint8_t level)
+{
+    const int left = 0;
+    const int right = LCD_H_RES;
+    const int base = 198;
+    const int top = 116;
+    const int step = 6;
+    const int bar_w = 4;
+    int x = s_wave_x;
+    if (x < left || x + bar_w >= right) x = left;
+
+    /* Erase only the next slice; do not blank the whole waveform at wrap. */
+    lcd_rect(x, top, x + step + bar_w, base, C_BG);
+    lcd_rect(x, base - 1, x + step + bar_w, base, C_LINE);
+
+    int h = 6 + (level * (base - top - 8)) / 100;
+    if (h > base - top) h = base - top;
+    if (h < 6) h = 6;
+    lcd_rect(x, base - h, x + bar_w, base, C_TEXT);
+    s_wave_x += step;
+    if (s_wave_x + bar_w >= right) s_wave_x = left;
+}
+
+static void ui_playback_update_levels(uint32_t frame)
+{
+    const int left = 0;
+    const int right = LCD_H_RES;
+    const int base = 198;
+    const int top = 116;
+    const int step = 6;
+    const int bar_w = 4;
+    int x = s_wave_x;
+    if (x < left || x + bar_w >= right) x = left;
+
+    lcd_rect(x, top, x + step + bar_w, base, C_BG);
+    lcd_rect(x, base - 1, x + step + bar_w, base, C_LINE);
+
+    int phase = (frame * 7 + x / step * 5) % 28;
+    int folded = phase < 14 ? phase : 28 - phase;
+    int h = 14 + folded * 4;
+    if ((frame + x / step) % 5 == 0) h += 18;
+    if (h > base - top) h = base - top;
+    lcd_rect(x, base - h, x + bar_w, base, C_TEXT);
+
+    s_wave_x += step;
+    if (s_wave_x + bar_w >= right) s_wave_x = left;
+}
+
+static void ui_show_recording(uint32_t elapsed_ms)
+{
+    memset(s_timer_prev, 0, sizeof(s_timer_prev));
+    s_wave_x = 0;
+    ui_recording_enter_animation();
+    ui_recording_draw_static(false);
+    ui_recording_update_time(elapsed_ms);
+    lcd_rect(0, 116, LCD_H_RES, 198, C_BG);
+    lcd_rect(0, 197, LCD_H_RES, 198, C_LINE);
 
     int pct = (int)((elapsed_ms * 100) / (MAX_RECORD_SECONDS * 1000));
     ESP_LOGI(TAG, "UI recording: clip=%03d elapsed=%" PRIu32 "ms pct=%d", s_active_clip_index, elapsed_ms, pct);
 }
 
-static void ui_show_saved(void)
+static void ui_show_playback(int clip_index, uint32_t elapsed_ms)
 {
-    lcd_fill(C_WHITE);
-    vTaskDelay(pdMS_TO_TICKS(180));
+    memset(s_timer_prev, 0, sizeof(s_timer_prev));
+    s_wave_x = 0;
+    ui_transition_fill(C_BG);
+    lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
+    draw_status(231, C_GREEN, "PLAY");
+    draw_clip_pill(clip_index);
+    ui_transition_end();
+    ui_recording_update_time(elapsed_ms);
+    lcd_rect(0, 116, LCD_H_RES, 198, C_BG);
+    lcd_rect(0, 197, LCD_H_RES, 198, C_LINE);
+}
+
+static void ui_show_saved(uint32_t elapsed_ms)
+{
+    ui_recording_update_time(elapsed_ms);
+    lcd_rect(0, 124, LCD_H_RES, 198, C_BG);
+    lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
+    draw_status(235, C_GREEN, "DONE");
+    draw_clip_pill(s_active_clip_index);
+    vTaskDelay(pdMS_TO_TICKS(900));
     ui_show_home();
+}
+
+static void ui_show_connecting(void)
+{
+    ui_transition_fill(C_BG);
+    draw_label_text(92, 156, "...", C_TEXT);
+    draw_status(230, C_AMBER, "CONNECTING...");
+    ui_transition_end();
+    s_upload_prev_pct = -1;
+    s_upload_prev_done = false;
+}
+
+static void ui_show_uploading(int pct)
+{
+    bool done = pct >= 100;
+    if (s_upload_prev_pct < 0) {
+        ui_transition_fill(C_BG);
+        ui_transition_end();
+    }
+    if (s_upload_prev_pct != pct) {
+        lcd_rect(20, 96, 220, 170, C_BG);
+    }
+    char label[8];
+    snprintf(label, sizeof(label), "%d%%", pct);
+    draw_big_text((LCD_H_RES - big_width(label)) / 2, 104, label, C_TEXT);
+    if (s_upload_prev_done != done || s_upload_prev_pct < 0) {
+        draw_status(230, C_GREEN, done ? "DONE" : "UPLOADING...");
+    }
+    s_upload_prev_pct = pct;
+    s_upload_prev_done = done;
+}
+
+static void ui_show_error(const char *label)
+{
+    ui_transition_fill(C_BG);
+    draw_face();
+    draw_status(230, C_RED, label);
+    ui_transition_end();
 }
 
 /* ---------------- Screen power (idle blank to avoid LCD image retention) ---------------- */
@@ -226,7 +774,12 @@ static void screen_sleep(void)
 static void screen_wake(void)
 {
     gpio_set_level(PIN_LCD_BL, 1);
+    if (!axp_vbus_good()) {
+        ui_show_battery(battery_percent());
+        vTaskDelay(pdMS_TO_TICKS(WAKE_BATTERY_MS));
+    }
     ui_show_home();
+    s_touch_was_down = false;
     s_screen_on = true;
     s_last_activity_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "screen wake");
@@ -305,15 +858,21 @@ static bool touch_record_pressed(void)
     uint16_t x = 0, y = 0;
     if (!touch_press_edge(&x, &y)) return false;
     if (s_recording_active) return true;
-    return hit_disc(x, y, 120, 178, 70);
+    return hit_disc(x, y, 120, 180, 82);
 }
 
 static touch_action_t touch_home_action(void)
 {
     uint16_t x = 0, y = 0;
     if (!touch_press_edge(&x, &y)) return TOUCH_ACTION_NONE;
-    if (hit_rect(x, y, 29, 32, 211, 78)) return TOUCH_ACTION_UPLOAD;
-    if (hit_disc(x, y, 120, 178, 70)) return TOUCH_ACTION_RECORD;
+    if (hit_rect(x, y, 20, 24, 220, 78)) {
+        draw_clips_pill_pressed(pending_clip_count());
+        return TOUCH_ACTION_CLIPS;
+    }
+    if (hit_disc(x, y, 120, 180, 82)) {
+        ui_home_record_pressed();
+        return TOUCH_ACTION_RECORD;
+    }
     return TOUCH_ACTION_NONE;
 }
 
@@ -374,8 +933,66 @@ static bool sd_mount(void)
 }
 
 /* ---------------- Audio (ES7210) ---------------- */
+static void audio_input_deinit(void)
+{
+    if (s_codec) {
+        esp_codec_dev_close(s_codec);
+        esp_codec_dev_delete(s_codec);
+        s_codec = NULL;
+    }
+    if (s_rec_codec_if) {
+        audio_codec_delete_codec_if(s_rec_codec_if);
+        s_rec_codec_if = NULL;
+    }
+    if (s_rec_ctrl_if) {
+        audio_codec_delete_ctrl_if(s_rec_ctrl_if);
+        s_rec_ctrl_if = NULL;
+    }
+    if (s_rec_data_if) {
+        audio_codec_delete_data_if(s_rec_data_if);
+        s_rec_data_if = NULL;
+    }
+    if (s_i2s_rx) {
+        i2s_channel_disable(s_i2s_rx);
+        i2s_del_channel(s_i2s_rx);
+        s_i2s_rx = NULL;
+    }
+}
+
+static void audio_output_deinit(void)
+{
+    if (s_play_codec) {
+        esp_codec_dev_close(s_play_codec);
+        esp_codec_dev_delete(s_play_codec);
+        s_play_codec = NULL;
+    }
+    if (s_play_codec_if) {
+        audio_codec_delete_codec_if(s_play_codec_if);
+        s_play_codec_if = NULL;
+    }
+    if (s_play_ctrl_if) {
+        audio_codec_delete_ctrl_if(s_play_ctrl_if);
+        s_play_ctrl_if = NULL;
+    }
+    if (s_play_gpio_if) {
+        audio_codec_delete_gpio_if(s_play_gpio_if);
+        s_play_gpio_if = NULL;
+    }
+    if (s_play_data_if) {
+        audio_codec_delete_data_if(s_play_data_if);
+        s_play_data_if = NULL;
+    }
+    if (s_i2s_tx) {
+        i2s_channel_disable(s_i2s_tx);
+        i2s_del_channel(s_i2s_tx);
+        s_i2s_tx = NULL;
+    }
+}
+
 static esp_err_t audio_init(void)
 {
+    if (s_codec && s_i2s_rx) return ESP_OK;
+
     /* I2S RX channel in TDM mode (es7210 driver defaults to Philips format) */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
     chan_cfg.dma_desc_num = 8;      /* more/larger DMA buffers (~0.5s slack) so SD/LCD */
@@ -400,47 +1017,49 @@ static esp_err_t audio_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_init_tdm_mode(s_i2s_rx, &tdm_cfg), TAG, "i2s tdm");
 
-    /* Shared I2C master bus for ES7210 control and CST816 touch. */
-    i2c_master_bus_config_t i2c_cfg = {
-        .i2c_port = I2C_PORT,
-        .sda_io_num = PIN_I2C_SDA,
-        .scl_io_num = PIN_I2C_SCL,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .flags.enable_internal_pullup = true,
-    };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
+    if (!s_i2c_bus) {
+        /* Shared I2C master bus for ES7210, ES8311, CST816 touch, and AXP2101. */
+        i2c_master_bus_config_t i2c_cfg = {
+            .i2c_port = I2C_PORT,
+            .sda_io_num = PIN_I2C_SDA,
+            .scl_io_num = PIN_I2C_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
+    }
 
     audio_codec_i2c_cfg_t ctrl_cfg = {
         .port = I2C_PORT,
         .addr = ES7210_CODEC_DEFAULT_ADDR,
         .bus_handle = s_i2c_bus,
     };
-    const audio_codec_ctrl_if_t *ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
-    ESP_RETURN_ON_FALSE(ctrl_if, ESP_FAIL, TAG, "es7210 i2c ctrl");
+    s_rec_ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
+    ESP_RETURN_ON_FALSE(s_rec_ctrl_if, ESP_FAIL, TAG, "es7210 i2c ctrl");
 
     audio_codec_i2s_cfg_t i2s_data_cfg = {
         .port = 0,
         .rx_handle = s_i2s_rx,
         .tx_handle = NULL,
     };
-    const audio_codec_data_if_t *data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
-    ESP_RETURN_ON_FALSE(data_if, ESP_FAIL, TAG, "es7210 i2s data");
+    s_rec_data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
+    ESP_RETURN_ON_FALSE(s_rec_data_if, ESP_FAIL, TAG, "es7210 i2s data");
 
     es7210_codec_cfg_t es_cfg = {
-        .ctrl_if = ctrl_if,
+        .ctrl_if = s_rec_ctrl_if,
         .master_mode = false,
         .mic_selected = MIC_SELECTED,
         .mclk_src = ES7210_MCLK_FROM_PAD,
         .mclk_div = I2S_MCLK_MULTIPLE_256,
     };
-    const audio_codec_if_t *es_if = es7210_codec_new(&es_cfg);
-    ESP_RETURN_ON_FALSE(es_if, ESP_FAIL, TAG, "es7210 new");
+    s_rec_codec_if = es7210_codec_new(&es_cfg);
+    ESP_RETURN_ON_FALSE(s_rec_codec_if, ESP_FAIL, TAG, "es7210 new");
 
     esp_codec_dev_cfg_t dev_cfg = {
         .dev_type = ESP_CODEC_DEV_TYPE_IN,
-        .codec_if = es_if,
-        .data_if = data_if,
+        .codec_if = s_rec_codec_if,
+        .data_if = s_rec_data_if,
     };
     s_codec = esp_codec_dev_new(&dev_cfg);
     ESP_RETURN_ON_FALSE(s_codec, ESP_FAIL, TAG, "codec dev new");
@@ -461,29 +1080,170 @@ static esp_err_t audio_init(void)
     return ESP_OK;
 }
 
-/* pick the next unused /sdcard/rec_NNN.wav */
+static esp_err_t audio_output_init(uint32_t sample_rate, int channels, int bits_per_sample)
+{
+    if (s_play_codec && s_i2s_tx) return ESP_OK;
+    if (channels != 1 && channels != 2) channels = 2;
+    if (bits_per_sample != 16 && bits_per_sample != 32) bits_per_sample = 16;
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
+    chan_cfg.dma_desc_num = 8;
+    chan_cfg.dma_frame_num = 512;
+    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL), TAG, "i2s tx new");
+
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bits_per_sample,
+                                                        channels == 1 ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = PIN_I2S_MCLK,
+            .bclk = PIN_I2S_BCLK,
+            .ws = PIN_I2S_WS,
+            .dout = PIN_I2S_DOUT,
+            .din = PIN_I2S_DIN,
+        },
+    };
+    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_tx, &std_cfg), TAG, "i2s tx std");
+    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s_tx), TAG, "i2s tx enable");
+
+    if (!s_i2c_bus) {
+        i2c_master_bus_config_t i2c_cfg = {
+            .i2c_port = I2C_PORT,
+            .sda_io_num = PIN_I2C_SDA,
+            .scl_io_num = PIN_I2C_SCL,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
+    }
+
+    audio_codec_i2s_cfg_t i2s_data_cfg = {
+        .port = I2S_NUM_0,
+        .rx_handle = NULL,
+        .tx_handle = s_i2s_tx,
+    };
+    s_play_data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
+    ESP_RETURN_ON_FALSE(s_play_data_if, ESP_FAIL, TAG, "es8311 i2s data");
+
+    audio_codec_i2c_cfg_t ctrl_cfg = {
+        .port = I2C_PORT,
+        .addr = ES8311_CODEC_DEFAULT_ADDR,
+        .bus_handle = s_i2c_bus,
+    };
+    s_play_ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
+    ESP_RETURN_ON_FALSE(s_play_ctrl_if, ESP_FAIL, TAG, "es8311 i2c ctrl");
+    s_play_gpio_if = audio_codec_new_gpio();
+    ESP_RETURN_ON_FALSE(s_play_gpio_if, ESP_FAIL, TAG, "es8311 gpio");
+
+    es8311_codec_cfg_t es_cfg = {
+        .ctrl_if = s_play_ctrl_if,
+        .gpio_if = s_play_gpio_if,
+        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
+        .pa_pin = -1,
+        .use_mclk = false,
+    };
+    s_play_codec_if = es8311_codec_new(&es_cfg);
+    ESP_RETURN_ON_FALSE(s_play_codec_if, ESP_FAIL, TAG, "es8311 new");
+
+    esp_codec_dev_cfg_t dev_cfg = {
+        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
+        .codec_if = s_play_codec_if,
+        .data_if = s_play_data_if,
+    };
+    s_play_codec = esp_codec_dev_new(&dev_cfg);
+    ESP_RETURN_ON_FALSE(s_play_codec, ESP_FAIL, TAG, "play codec dev new");
+
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = bits_per_sample,
+        .channel = channels,
+        .sample_rate = sample_rate,
+    };
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_play_codec, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "play codec open");
+    esp_codec_dev_set_out_vol(s_play_codec, 75);
+
+    ESP_LOGI(TAG, "ES8311 ready: %" PRIu32 " Hz, %d ch, %d-bit", sample_rate, channels, bits_per_sample);
+    return ESP_OK;
+}
+
+static bool parse_clip_index(const char *name, int *index)
+{
+    if (strlen(name) != 11) return false;
+    if (strncasecmp(name, "rec_", 4) != 0 || strcasecmp(name + 7, ".wav") != 0) {
+        return false;
+    }
+    if (name[4] < '0' || name[4] > '9' ||
+        name[5] < '0' || name[5] > '9' ||
+        name[6] < '0' || name[6] > '9') {
+        return false;
+    }
+    int value = (name[4] - '0') * 100 + (name[5] - '0') * 10 + (name[6] - '0');
+    if (value <= 0 || value >= 1000) return false;
+    *index = value;
+    return true;
+}
+
+static int compare_ints(const void *a, const void *b)
+{
+    int ia = *(const int *)a;
+    int ib = *(const int *)b;
+    return (ia > ib) - (ia < ib);
+}
+
+static int collect_clip_indices_all(int *indices, int max_indices)
+{
+    DIR *d = opendir(CLIPS_DIR);
+    if (!d) return 0;
+    int count = 0;
+    struct dirent *e;
+    while (count < max_indices && (e = readdir(d)) != NULL) {
+        int idx = 0;
+        if (parse_clip_index(e->d_name, &idx)) indices[count++] = idx;
+    }
+    closedir(d);
+    qsort(indices, count, sizeof(indices[0]), compare_ints);
+    return count;
+}
+
+/* pick the next unused /sdcard/clips/rec_NNN.wav */
 static int next_index(void)
 {
+    bool used[1000] = {0};
+    int indices[999];
+    int count = collect_clip_indices_all(indices, 999);
+    for (int i = 0; i < count; i++) used[indices[i]] = true;
     for (int i = 1; i < 1000; i++) {
-        char path[80];
-        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
-        FILE *f = fopen(path, "r");
-        if (!f) return i;
-        fclose(f);
+        if (!used[i]) return i;
     }
     return 999;
 }
 
 static int pending_clip_count(void)
 {
-    int total = 0;
-    for (int i = 1; i < 1000; i++) {
-        char path[80];
-        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
-        FILE *p = fopen(path, "r");
-        if (p) { fclose(p); total++; }
+    int indices[999];
+    return collect_clip_indices_all(indices, 999);
+}
+
+static int collect_clip_indices_page(int *indices, int max_indices, int offset)
+{
+    int all[999];
+    int total = collect_clip_indices_all(all, 999);
+    int count = 0;
+    for (int i = offset; i < total && count < max_indices; i++) indices[count++] = all[i];
+    return count;
+}
+
+static bool delete_clip_index(int index)
+{
+    char path[80];
+    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
+    if (remove(path) == 0) {
+        ESP_LOGI(TAG, "deleted %s", path);
+        return true;
     }
-    return total;
+    ESP_LOGW(TAG, "delete failed: %s", path);
+    return false;
 }
 
 /* Ensure /sdcard/clips exists, and move any legacy rec_*.wav out of the card root into it. */
@@ -515,6 +1275,28 @@ static void ensure_clips_folder(void)
     if (moved) ESP_LOGI(TAG, "moved %d clip(s) from root into %s", moved, CLIPS_DIR);
 }
 
+static uint8_t audio_level_from_pcm(const uint8_t *buf, size_t bytes)
+{
+    const int16_t *samples = (const int16_t *)buf;
+    size_t count = bytes / sizeof(int16_t);
+    if (count == 0) return 0;
+
+    uint64_t acc = 0;
+    size_t used = 0;
+    for (size_t i = 0; i < count; i += 2) {  /* MIC1 sample from each stereo frame */
+        int32_t v = samples[i];
+        acc += (uint32_t)(v < 0 ? -v : v);
+        used++;
+    }
+    if (used == 0) return 0;
+    uint32_t avg = (uint32_t)(acc / used);
+
+    int level = (int)((avg * 100) / 3200);
+    if (level < 8 && avg > 120) level = 8;
+    if (level > 100) level = 100;
+    return (uint8_t)level;
+}
+
 /* Record audio to a WAV until stop is requested or the safety cap is reached. */
 static void record_wav(int index)
 {
@@ -541,7 +1323,10 @@ static void record_wav(int index)
 
     uint32_t written = 0;
     int last_pct = -1;
+    int last_ui_second = -1;
+    int64_t last_level_ms = 0;
     int64_t start_tick = esp_timer_get_time() / 1000;
+    uint32_t elapsed_ms = 0;
     bool stop_armed = false;
     while (written < max_wav_size) {
         size_t to_read = sizeof(buf);
@@ -552,10 +1337,19 @@ static void record_wav(int index)
         fwrite(buf, got, 1, f);
         written += got;
 
-        uint32_t elapsed_ms = (uint32_t)((esp_timer_get_time() / 1000) - start_tick);
+        elapsed_ms = (uint32_t)((esp_timer_get_time() / 1000) - start_tick);
         int pct = (int)(100.0f * written / max_wav_size);
         if (pct / 20 != last_pct / 20) { ESP_LOGI(TAG, "  %d%%", pct); }
         last_pct = pct;
+        int ui_second = elapsed_ms / 1000;
+        if (ui_second != last_ui_second) {
+            ui_recording_update_time(elapsed_ms);
+            last_ui_second = ui_second;
+        }
+        if ((int64_t)elapsed_ms - last_level_ms >= 120) {
+            ui_recording_update_levels(audio_level_from_pcm(buf, got));
+            last_level_ms = elapsed_ms;
+        }
 
         if (gpio_get_level(PIN_BTN) == 1) stop_armed = true;
         bool stop_pressed = stop_armed && gpio_get_level(PIN_BTN) == 0;
@@ -570,7 +1364,7 @@ static void record_wav(int index)
     fclose(f);
     s_recording_active = false;
     ESP_LOGI(TAG, "Saved %s (%" PRIu32 " bytes)", path, written);
-    ui_show_saved();
+    ui_show_saved(elapsed_ms);
 }
 
 /* ---------------- WiFi upload (creds + server URL from /sdcard/wifi.txt) ---------------- */
@@ -585,7 +1379,7 @@ typedef struct {
 static bool read_wifi_conf(wifi_conf_t *c)
 {
     memset(c, 0, sizeof(*c));
-    strlcpy(c->server, "http://10.0.0.240:8092", sizeof(c->server));  /* default */
+    strlcpy(c->server, "http://10.0.0.240:8090", sizeof(c->server));  /* default */
 
     FILE *f = fopen(MOUNT_POINT "/wifi.txt", "r");
     if (!f) {
@@ -835,32 +1629,25 @@ done:
     return status;
 }
 
-/* Blue screen with a white progress bar filled to done/total. */
 static void upload_progress(int done, int total)
 {
-    lcd_fill(C_BLUE);
-    const int margin = 20;
-    const int bar_w = LCD_H_RES - 2 * margin;
-    const int bar_y = LCD_V_RES / 2 - 14;
-    const int bar_h = 28;
-    lcd_rect(margin, bar_y, margin + bar_w, bar_y + bar_h, C_CHARCOAL);   /* track */
-    int fill_w = (total > 0) ? (bar_w * done / total) : 0;
-    if (fill_w > 0) lcd_rect(margin, bar_y, margin + fill_w, bar_y + bar_h, C_WHITE);
+    int pct = (total > 0) ? (100 * done / total) : 100;
+    ui_show_uploading(pct);
 }
 
 static void upload_pending_clips(void)
 {
     /* WiFi and I2S are used in separate modes (per PRD): upload only happens while idle. */
-    lcd_fill(C_BLUE);   /* connecting… */
+    ui_show_connecting();
 
     wifi_conf_t conf;
     if (!read_wifi_conf(&conf)) {
         ESP_LOGE(TAG, "Upload aborted: no usable /sdcard/wifi.txt");
-        lcd_fill(C_RED); vTaskDelay(pdMS_TO_TICKS(900)); return;
+        ui_show_error("NO WIFI"); vTaskDelay(pdMS_TO_TICKS(1400)); return;
     }
     ESP_LOGI(TAG, "Upload: connecting to ssid='%s' (server=%s)", conf.ssid, conf.server);
     if (wifi_up(&conf) != ESP_OK) {
-        lcd_fill(C_RED); vTaskDelay(pdMS_TO_TICKS(900)); return;
+        ui_show_error("NO WIFI"); vTaskDelay(pdMS_TO_TICKS(1400)); return;
     }
 
     /* Count clips to sync so we can show progress. */
@@ -900,9 +1687,155 @@ static void upload_pending_clips(void)
     }
 
     wifi_down();
-    lcd_fill(failed == 0 ? C_GREEN : C_RED);   /* green only on a fully clean sync */
+    if (failed == 0) ui_show_uploading(100);
+    else ui_show_error("NO SERVER");
     vTaskDelay(pdMS_TO_TICKS(1200));
     ESP_LOGI(TAG, "Sync finished: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+}
+
+static void preview_clip_index(int index)
+{
+    char path[80];
+    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGW(TAG, "preview open failed: %s", path);
+        ui_show_error("NO CLIP");
+        vTaskDelay(pdMS_TO_TICKS(900));
+        return;
+    }
+
+    wav_header_t hdr;
+    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
+        memcmp(hdr.descriptor_chunk.chunk_id, "RIFF", 4) != 0 ||
+        memcmp(hdr.descriptor_chunk.chunk_format, "WAVE", 4) != 0 ||
+        memcmp(hdr.data_chunk.subchunk_id, "data", 4) != 0 ||
+        hdr.fmt_chunk.audio_format != 1 ||
+        (hdr.fmt_chunk.bits_per_sample != 16 && hdr.fmt_chunk.bits_per_sample != 32)) {
+        fclose(f);
+        ESP_LOGW(TAG, "preview unsupported WAV: %s", path);
+        ui_show_error("NO CLIP");
+        vTaskDelay(pdMS_TO_TICKS(900));
+        return;
+    }
+
+    uint32_t sample_rate = hdr.fmt_chunk.sample_rate ? hdr.fmt_chunk.sample_rate : SAMPLE_RATE;
+    int channels = hdr.fmt_chunk.num_of_channels ? hdr.fmt_chunk.num_of_channels : CHAN_NUM;
+    int bits = hdr.fmt_chunk.bits_per_sample;
+
+    ui_show_playback(index, 0);
+    audio_input_deinit();
+    if (audio_output_init(sample_rate, channels, bits) != ESP_OK) {
+        fclose(f);
+        audio_output_deinit();
+        ESP_LOGE(TAG, "preview audio output init failed");
+        ui_show_error("NO AUDIO");
+        vTaskDelay(pdMS_TO_TICKS(900));
+        audio_init();
+        return;
+    }
+
+    uint8_t buf[2048];
+    uint32_t remaining = hdr.data_chunk.subchunk_size;
+    uint32_t played = 0;
+    int64_t last_bar_ms = 0;
+    uint32_t frame = 0;
+
+    while (remaining > 0) {
+        size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
+        size_t got = fread(buf, 1, want, f);
+        if (got == 0) break;
+        if (esp_codec_dev_write(s_play_codec, buf, (int)got) != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "preview write failed");
+            break;
+        }
+        played += got;
+        remaining -= got;
+
+        uint32_t elapsed_ms = (hdr.fmt_chunk.byte_rate > 0) ? (played * 1000U / hdr.fmt_chunk.byte_rate) : 0;
+        ui_recording_update_time(elapsed_ms);
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_bar_ms >= 70) {
+            ui_playback_update_levels(frame++);
+            last_bar_ms = now_ms;
+        }
+    }
+
+    fclose(f);
+    audio_output_deinit();
+    audio_init();
+    draw_status(235, C_GREEN, "DONE");
+    vTaskDelay(pdMS_TO_TICKS(350));
+}
+
+static void clip_menu_loop(void)
+{
+    int indices[3] = {0};
+    int total = pending_clip_count();
+    int offset = 0;
+    int visible = collect_clip_indices_page(indices, 3, offset);
+    ui_show_clip_menu(indices, visible, total, offset);
+
+    while (1) {
+        uint16_t x = 0, y = 0;
+        if (touch_press_edge(&x, &y)) {
+            s_last_activity_ms = esp_timer_get_time() / 1000;
+            if (hit_rect(x, y, 20, 16, 220, 68)) {
+                draw_upload_pill_pressed(pending_clip_count());
+                if (pending_clip_count() > 0) upload_pending_clips();
+                return;
+            }
+            if (hit_rect(x, y, 76, 246, 164, 284)) {
+                draw_pill_pressed(250, "BACK");
+                return;
+            }
+            if (hit_rect(x, y, 20, 246, 70, 284)) {
+                draw_icon_press_flash(42, 265, false);
+                if (offset > 0) offset--;
+                total = pending_clip_count();
+                visible = collect_clip_indices_page(indices, 3, offset);
+                ui_show_clip_menu(indices, visible, total, offset);
+                continue;
+            }
+            if (hit_rect(x, y, 170, 246, 224, 284)) {
+                draw_icon_press_flash(198, 265, false);
+                if (offset + visible < total) offset++;
+                total = pending_clip_count();
+                visible = collect_clip_indices_page(indices, 3, offset);
+                ui_show_clip_menu(indices, visible, total, offset);
+                continue;
+            }
+
+            for (int i = 0; i < visible; i++) {
+                int row_y = 70 + i * 64;
+                if (hit_rect(x, y, 0, row_y, 70, row_y + 58)) {
+                    draw_icon_press_flash(33, row_y + 29, false);
+                    preview_clip_index(indices[i]);
+                    total = pending_clip_count();
+                    if (offset >= total && offset > 0) offset = total - 1;
+                    visible = collect_clip_indices_page(indices, 3, offset);
+                    ui_show_clip_menu(indices, visible, total, offset);
+                    break;
+                }
+                if (hit_rect(x, y, 176, row_y, 240, row_y + 58)) {
+                    draw_icon_press_flash(210, row_y + 29, true);
+                    delete_clip_index(indices[i]);
+                    total = pending_clip_count();
+                    if (offset > 0 && offset + visible > total) offset--;
+                    visible = collect_clip_indices_page(indices, 3, offset);
+                    ui_show_clip_menu(indices, visible, total, offset);
+                    break;
+                }
+            }
+        }
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (s_screen_on && (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
+            screen_sleep();
+            return;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 void app_main(void)
@@ -973,9 +1906,9 @@ void app_main(void)
             s_last_activity_ms = now_ms;
         }
 
-        if (touch_action == TOUCH_ACTION_UPLOAD) {
-            upload_pending_clips();
-            ui_show_home();
+        if (touch_action == TOUCH_ACTION_CLIPS) {
+            clip_menu_loop();
+            if (s_screen_on) ui_show_home();
             s_last_activity_ms = esp_timer_get_time() / 1000;
         }
         if ((prev == 1 && level == 0) || touch_action == TOUCH_ACTION_RECORD) {
