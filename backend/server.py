@@ -89,8 +89,17 @@ def auto_process_clip(clip_id: str, capture_timestamp: str | None = None) -> Non
         process_clip(clip_id, ProcessRequest(capture_timestamp=capture_timestamp))
     except HTTPException as exc:
         update_clip(clip_id, {"status": "error", "error": str(exc.detail)})
+        return
     except Exception as exc:
         update_clip(clip_id, {"status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        return
+
+    # Fully automatic: push the fresh card into Anki and sync to AnkiWeb (-> phone).
+    # Best-effort — if Anki is unreachable, leave the clip 'processed' so it can be retried.
+    try:
+        _persist_to_anki(clip_id)
+    except Exception as exc:
+        update_clip(clip_id, {"anki_sync_error": f"{type(exc).__name__}: {exc}"})
 
 
 def _anki_tags(note: dict[str, Any]) -> list[str]:
@@ -353,8 +362,12 @@ def approve_clip(clip_id: str) -> dict[str, Any]:
     return update_clip(clip_id, {"status": "approved"})
 
 
-@app.post("/api/clips/{clip_id}/save-to-anki")
-def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
+def _persist_to_anki(clip_id: str) -> dict[str, Any]:
+    """Add the clip's card to Anki and sync to AnkiWeb. Shared by the manual
+    save endpoint and the automatic upload path.
+
+    Raises ValueError if no note is ready, or RuntimeError if AnkiConnect fails.
+    """
     clip = find_clip(clip_id)
     note = clip.get("anki")
     if not note:
@@ -367,17 +380,13 @@ def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
             }
             clip = update_clip(clip_id, {"anki": note})
     if not note:
-        raise HTTPException(status_code=400, detail="No Anki note is ready for this clip")
+        raise ValueError("No Anki note is ready for this clip")
 
     settings.apply_to_env()
     if not os.getenv("ANKI_CONNECT_URL", "").strip():
         return update_clip(clip_id, {"status": "approved", "anki_save_mode": "csv"})
 
-    try:
-        note_id = add_note_to_anki(note)
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-
+    note_id = add_note_to_anki(note)
     synced, sync_error = sync_anki()
     updates = {
         "status": "exported",
@@ -391,6 +400,16 @@ def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
     else:
         updates["anki_sync_error"] = sync_error or "Anki sync failed"
     return update_clip(clip_id, updates)
+
+
+@app.post("/api/clips/{clip_id}/save-to-anki")
+def save_clip_to_anki(clip_id: str) -> dict[str, Any]:
+    try:
+        return _persist_to_anki(clip_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.delete("/api/clips/{clip_id}", status_code=204)
