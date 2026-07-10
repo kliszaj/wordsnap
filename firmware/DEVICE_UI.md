@@ -45,10 +45,12 @@ The firmware UI now follows the supplied 240x284 WordSnap device mocks.
   - Keeps the elapsed timer on screen briefly.
   - Bottom rail shows green `DONE` and snap number.
 - **Wake battery overlay**
-  - On wake from idle-off, shows battery for 2 seconds, then returns to idle.
+  - On wake from idle-off, shows battery for 2 seconds only when unplugged and at or below 30%.
+  - Red appears below 15%; amber appears from 15% through 30%.
+  - Above 30%, no battery overlay is shown.
   - Reads AXP2101 fuel gauge register `0xA4`; falls back to medium battery if unavailable.
 - **Connecting**
-  - Center dots plus amber `CONNECTING...`.
+  - Center WiFi icon plus amber `CONNECTING...`.
 - **Uploading**
   - Large percentage plus green `UPLOADING...`.
 - **Done uploading**

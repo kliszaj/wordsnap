@@ -31,8 +31,9 @@ SETTINGS_PATH = DATA_DIR / "settings.json"
 SECRET_KEYS = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY")
 MODEL_KEYS = ("WHISPER_MODEL", "CLAUDE_MODEL", "GPT_MODEL")
 ANKI_KEYS = ("ANKI_CONNECT_URL", "ANKI_DECK")
+PROVIDER_KEYS = ("LLM_PROVIDER",)
 FLAG_KEYS = ("AUTO_ANKI",)  # boolean-ish flags stored as "1"/"0"
-MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS + ANKI_KEYS + FLAG_KEYS
+MANAGED_KEYS = SECRET_KEYS + MODEL_KEYS + ANKI_KEYS + PROVIDER_KEYS + FLAG_KEYS
 
 _MODEL_DEFAULTS = {
     "WHISPER_MODEL": DEFAULT_WHISPER_MODEL,
@@ -48,6 +49,12 @@ _ENV_BASELINE = {name: os.environ.get(name) for name in MANAGED_KEYS}
 def auto_anki_enabled() -> bool:
     """Whether each upload auto-saves to Anki and syncs. Default ON when unset."""
     return os.getenv("AUTO_ANKI", "1").strip().lower() not in ("0", "false", "off", "no")
+
+
+def preferred_llm_provider() -> str:
+    """Primary enrichment provider. The other provider is used as fallback."""
+    value = os.getenv("LLM_PROVIDER", "anthropic").strip().lower()
+    return value if value in ("anthropic", "openai") else "anthropic"
 
 
 def _read_file() -> dict[str, Any]:
@@ -128,6 +135,7 @@ def status() -> dict[str, Any]:
     return {
         "secrets": secrets,
         "models": models,
+        "llm_provider": preferred_llm_provider(),
         "anki": {
             "connect_url": os.getenv("ANKI_CONNECT_URL", ""),
             "deck": os.getenv("ANKI_DECK", "Default"),

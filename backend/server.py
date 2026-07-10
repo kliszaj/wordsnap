@@ -19,13 +19,14 @@ from pydantic import BaseModel
 from anki_format import anki_note, front_with_article
 from compare import (
     DEFAULT_CLAUDE_MODEL,
+    DEFAULT_GPT_MODEL,
     DEFAULT_WHISPER_MODEL,
     derive_clip_metadata,
     load_environment,
     model_to_dict,
 )
 from enrich_claude import enrich_with_claude
-from enrich_openai import transcribe
+from enrich_openai import enrich_with_gpt, transcribe
 from store import DATA_DIR, add_clip, delete_clip, find_clip, load_clips, update_clip, utc_now
 
 import settings
@@ -66,6 +67,7 @@ class AutoSyncPatch(BaseModel):
 class SettingsPatch(BaseModel):
     openai_api_key: str | None = None
     anthropic_api_key: str | None = None
+    llm_provider: str | None = None
     whisper_model: str | None = None
     claude_model: str | None = None
     gpt_model: str | None = None
@@ -106,6 +108,37 @@ def auto_process_clip(clip_id: str, capture_timestamp: str | None = None) -> Non
             _persist_to_anki(clip_id)
         except Exception as exc:
             update_clip(clip_id, {"anki_sync_error": f"{type(exc).__name__}: {exc}"})
+
+
+def _provider_order() -> list[str]:
+    primary = settings.preferred_llm_provider()
+    fallback = "openai" if primary == "anthropic" else "anthropic"
+    return [primary, fallback]
+
+
+def _enrich_with_provider(provider: str, enrichment_input: str):
+    if provider == "anthropic":
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise RuntimeError("Anthropic API key not configured")
+        return enrich_with_claude(enrichment_input, model=os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL))
+    if provider == "openai":
+        if not os.getenv("OPENAI_API_KEY"):
+            raise RuntimeError("OpenAI API key not configured")
+        return enrich_with_gpt(enrichment_input, model=os.getenv("GPT_MODEL", DEFAULT_GPT_MODEL))
+    raise RuntimeError(f"Unknown LLM provider: {provider}")
+
+
+def enrich_with_fallback(enrichment_input: str) -> tuple[Any, str, str]:
+    errors: list[str] = []
+    for provider in _provider_order():
+        try:
+            card = _enrich_with_provider(provider, enrichment_input)
+            if card is None:
+                raise RuntimeError("model returned no parsed card")
+            return card, provider, "; ".join(errors)
+        except Exception as exc:
+            errors.append(f"{provider}: {type(exc).__name__}: {exc}")
+    raise RuntimeError("All LLM providers failed: " + " | ".join(errors))
 
 
 def _anki_tags(note: dict[str, Any]) -> list[str]:
@@ -251,6 +284,7 @@ def save_settings(patch: SettingsPatch) -> dict[str, Any]:
     field_to_env = {
         "openai_api_key": "OPENAI_API_KEY",
         "anthropic_api_key": "ANTHROPIC_API_KEY",
+        "llm_provider": "LLM_PROVIDER",
         "whisper_model": "WHISPER_MODEL",
         "claude_model": "CLAUDE_MODEL",
         "gpt_model": "GPT_MODEL",
@@ -258,6 +292,11 @@ def save_settings(patch: SettingsPatch) -> dict[str, Any]:
         "anki_deck": "ANKI_DECK",
     }
     provided = patch.model_dump(exclude_unset=True)
+    if "llm_provider" in provided:
+        provider = (provided["llm_provider"] or "").strip().lower()
+        if provider and provider not in {"anthropic", "openai"}:
+            raise HTTPException(status_code=400, detail="LLM provider must be anthropic or openai")
+        provided["llm_provider"] = provider
     updates = {env: provided[field] for field, env in field_to_env.items() if field in provided}
     data = settings.update_settings(updates)
     data["anki"]["connection"] = anki_connection_status()
@@ -312,8 +351,6 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
     request = request or ProcessRequest()
     load_environment()
     settings.apply_to_env()
-    if not os.getenv("ANTHROPIC_API_KEY"):
-        raise HTTPException(status_code=400, detail="Anthropic API key not configured. Add it in Settings.")
 
     clip = find_clip(clip_id)
     wav_path = Path(clip["stored_path"])
@@ -333,9 +370,7 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
         if requested_front:
             enrichment_input = f"{transcript}\nTarget Swedish item correction from reviewer: {requested_front}"
 
-        card = enrich_with_claude(enrichment_input, model=os.getenv("CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL))
-        if card is None:
-            raise RuntimeError("Claude returned no parsed card")
+        card, provider_used, fallback_error = enrich_with_fallback(enrichment_input)
 
         capture_timestamp, iso_week, _ = derive_clip_metadata(
             wav_path,
@@ -349,6 +384,8 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
             "capture_timestamp": capture_timestamp,
             "iso_week": iso_week,
             "anki": note,
+            "llm_provider": provider_used,
+            "llm_fallback_error": fallback_error,
             **model_to_dict(card),
             "error": "",
         }

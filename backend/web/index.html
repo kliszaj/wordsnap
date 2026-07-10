@@ -3,33 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>WordSnap Hoth</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=20260709-3" />
+    <title>wordsnap</title>
+    <link rel="stylesheet" href="/assets/styles.css?v=20260709-7" />
   </head>
   <body>
     <main class="shell">
       <header class="app-header">
         <div>
-          <p class="eyebrow">Hoth receiver</p>
-          <h1>wordclip.</h1>
-        </div>
-        <div class="metric-strip" aria-label="Dashboard metrics">
-          <div class="metric">
-            <span id="metric-total">00</span>
-            <label>snips</label>
-          </div>
-          <div class="metric">
-            <span id="metric-ready">00</span>
-            <label>ready</label>
-          </div>
-          <div class="metric">
-            <span id="metric-saved">00</span>
-            <label>saved</label>
-          </div>
-          <div class="metric">
-            <span id="pending-count">[00]</span>
-            <label>pending</label>
-          </div>
+          <h1>wordsnap</h1>
         </div>
         <div class="toolbar-actions">
           <label class="auto-sync" title="Auto-save new snips to Anki and sync to your phone">
@@ -38,11 +19,6 @@
             <span class="auto-sync-text">Auto-sync</span>
           </label>
           <button type="button" class="ghost-button" id="settings-open">Settings</button>
-          <label class="file-button">
-            Upload
-            <input id="file-input" type="file" accept="audio/wav,.wav" multiple />
-          </label>
-          <a class="ghost-button strong" href="/api/export/anki.csv">Export CSV</a>
         </div>
       </header>
 
@@ -87,6 +63,13 @@
 
         <fieldset class="settings-group">
           <legend>Models (optional overrides)</legend>
+          <label class="settings-field">
+            <span class="settings-label">LLM provider</span>
+            <select id="input-llm-provider">
+              <option value="anthropic">Anthropic first, OpenAI fallback</option>
+              <option value="openai">OpenAI first, Anthropic fallback</option>
+            </select>
+          </label>
           <label class="settings-field">
             <span class="settings-label">Claude model</span>
             <input type="text" id="input-claude-model" autocomplete="off" spellcheck="false" />
@@ -159,9 +142,7 @@
           <section class="tape-card">
             <div class="card-head">
               <span class="stage-number">01</span>
-              <div>
-                <h3>Transcription</h3>
-              </div>
+              <h3>transcription</h3>
             </div>
             <label>
               Transcript correction
@@ -171,32 +152,14 @@
               Swedish item
               <input class="card-front" />
             </label>
-            <button class="process" type="button">Transcribe</button>
           </section>
+
+          <button class="pipeline-sync" type="button">Sync</button>
 
           <section class="tape-card">
             <div class="card-head">
               <span class="stage-number">02</span>
-              <div>
-                <h3>Translation</h3>
-              </div>
-            </div>
-            <label>
-              Swedish explanation
-              <textarea class="swedish-definition" rows="7"></textarea>
-            </label>
-            <label>
-              English meaning
-              <input class="english-definition" />
-            </label>
-          </section>
-
-          <section class="tape-card">
-            <div class="card-head">
-              <span class="stage-number">03</span>
-              <div>
-                <h3>Anki library</h3>
-              </div>
+              <h3>anki</h3>
             </div>
             <div class="anki-preview" aria-label="Anki preview">
               <div class="preview-field">
@@ -208,13 +171,12 @@
                 <div class="back"></div>
               </div>
             </div>
-            <button class="save-anki" type="button">Save to Anki</button>
           </section>
         </div>
         <p class="error"></p>
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260709-3"></script>
+    <script src="/assets/app.js?v=20260709-7"></script>
   </body>
 </html>

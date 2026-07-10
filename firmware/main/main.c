@@ -143,11 +143,14 @@ static int s_active_clip_index = 0;
 static bool s_recording_active = false;
 static bool s_touch_was_down = false;
 static bool s_screen_on = true;
+static bool s_upload_active = false;
 static int64_t s_last_activity_ms = 0;
 static char s_timer_prev[6] = "";
 static int s_wave_x = 0;
 static int s_upload_prev_pct = -1;
 static bool s_upload_prev_done = false;
+static esp_pm_lock_handle_t s_upload_pm_lock = NULL;
+static bool s_upload_pm_lock_held = false;
 static int s_home_charge_state = -1;
 static int s_home_charge_pct = -1;
 static int64_t s_next_charge_check_ms = 0;
@@ -466,8 +469,9 @@ static void ui_show_battery(int pct)
     int x = 60, y = 114, w = 120, h = 62;
     lcd_round_rect_outline(x, y, w, h, 16, 3, C_TEXT, C_BG);
     lcd_round_rect_fill(x + w + 4, y + 22, 7, 18, 2, C_TEXT);
-    int fill_w = pct <= 20 ? 16 : 38;
-    uint16_t fill = pct <= 20 ? C_RED : C_AMBER;
+    int fill_w = (w - 10) * pct / 100;
+    if (fill_w < 8) fill_w = 8;
+    uint16_t fill = pct < 15 ? C_RED : C_AMBER;
     lcd_round_rect_fill(x + 5, y + 5, fill_w, h - 10, 11, fill);
     ui_transition_end();
 }
@@ -873,10 +877,33 @@ static void ui_show_saved(uint32_t elapsed_ms)
     ui_show_home();
 }
 
+static void draw_wifi_icon(uint16_t color)
+{
+    static const int outer[][2] = {
+        {58, 124}, {78, 107}, {101, 98}, {120, 96}, {139, 98}, {162, 107}, {182, 124},
+    };
+    static const int middle[][2] = {
+        {83, 146}, {98, 134}, {112, 129}, {120, 128}, {128, 129}, {142, 134}, {157, 146},
+    };
+    static const int inner[][2] = {
+        {100, 164}, {110, 156}, {120, 153}, {130, 156}, {140, 164},
+    };
+    for (int i = 0; i < (int)(sizeof(outer) / sizeof(outer[0])) - 1; i++) {
+        lcd_line(outer[i][0], outer[i][1], outer[i + 1][0], outer[i + 1][1], 6, color);
+    }
+    for (int i = 0; i < (int)(sizeof(middle) / sizeof(middle[0])) - 1; i++) {
+        lcd_line(middle[i][0], middle[i][1], middle[i + 1][0], middle[i + 1][1], 6, color);
+    }
+    for (int i = 0; i < (int)(sizeof(inner) / sizeof(inner[0])) - 1; i++) {
+        lcd_line(inner[i][0], inner[i][1], inner[i + 1][0], inner[i + 1][1], 6, color);
+    }
+    lcd_disc(120, 179, 8, color);
+}
+
 static void ui_show_connecting(void)
 {
     ui_transition_fill(C_BG);
-    draw_label_text(92, 156, "...", C_TEXT);
+    draw_wifi_icon(C_TEXT);
     draw_status(230, C_AMBER, "CONNECTING...");
     ui_transition_end();
     s_upload_prev_pct = -1;
@@ -903,10 +930,15 @@ static void ui_show_uploading(int pct)
         ui_draw_upload_percent(pct);
     } else if (s_upload_prev_pct != pct) {
         int start = s_upload_prev_pct;
-        int step = (pct > start) ? 1 : -1;
-        for (int value = start + step; value != pct + step; value += step) {
+        int delta = pct - start;
+        int distance = abs(delta);
+        int frames = distance;
+        if (done || frames > 8) frames = 1;
+        for (int frame = 1; frame <= frames; frame++) {
+            int value = start + (delta * frame) / frames;
+            if (frame == frames) value = pct;
             ui_draw_upload_percent(value);
-            vTaskDelay(pdMS_TO_TICKS(12));
+            if (frames > 1) vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
@@ -925,6 +957,38 @@ static void ui_show_error(const char *label)
     ui_transition_end();
 }
 
+static void keep_screen_awake(void)
+{
+    s_last_activity_ms = esp_timer_get_time() / 1000;
+}
+
+static void upload_busy_begin(void)
+{
+    s_upload_active = true;
+    keep_screen_awake();
+    if (s_upload_pm_lock && !s_upload_pm_lock_held) {
+        esp_err_t err = esp_pm_lock_acquire(s_upload_pm_lock);
+        if (err == ESP_OK) {
+            s_upload_pm_lock_held = true;
+        } else {
+            ESP_LOGW(TAG, "upload PM lock acquire failed: %s", esp_err_to_name(err));
+        }
+    }
+}
+
+static void upload_busy_end(void)
+{
+    keep_screen_awake();
+    if (s_upload_pm_lock && s_upload_pm_lock_held) {
+        esp_err_t err = esp_pm_lock_release(s_upload_pm_lock);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "upload PM lock release failed: %s", esp_err_to_name(err));
+        }
+        s_upload_pm_lock_held = false;
+    }
+    s_upload_active = false;
+}
+
 /* ---------------- Screen power (idle blank to avoid LCD image retention) ---------------- */
 static void screen_sleep(void)
 {
@@ -938,8 +1002,11 @@ static void screen_wake(void)
 {
     gpio_set_level(PIN_LCD_BL, 1);
     if (!axp_vbus_good()) {
-        ui_show_battery(battery_percent());
-        vTaskDelay(pdMS_TO_TICKS(WAKE_BATTERY_MS));
+        int pct = battery_percent();
+        if (pct <= 30) {
+            ui_show_battery(pct);
+            vTaskDelay(pdMS_TO_TICKS(WAKE_BATTERY_MS));
+        }
     }
     ui_show_home();
     s_touch_was_down = false;
@@ -1833,6 +1900,7 @@ done:
 
 static void upload_progress(int done, int total)
 {
+    keep_screen_awake();
     int pct = (total > 0) ? (100 * done / total) : 100;
     ui_show_uploading(pct);
 }
@@ -1840,16 +1908,23 @@ static void upload_progress(int done, int total)
 static void upload_pending_clips(void)
 {
     /* WiFi and I2S are used in separate modes (per PRD): upload only happens while idle. */
+    upload_busy_begin();
     ui_show_connecting();
 
     wifi_conf_t conf;
     if (!read_wifi_conf(&conf)) {
         ESP_LOGE(TAG, "Upload aborted: no usable /sdcard/wifi.txt");
-        ui_show_error("NO WIFI"); vTaskDelay(pdMS_TO_TICKS(1400)); return;
+        ui_show_error("NO WIFI");
+        vTaskDelay(pdMS_TO_TICKS(1400));
+        upload_busy_end();
+        return;
     }
     ESP_LOGI(TAG, "Upload: connecting to ssid='%s' (server=%s)", conf.ssid, conf.server);
     if (wifi_up(&conf) != ESP_OK) {
-        ui_show_error("NO WIFI"); vTaskDelay(pdMS_TO_TICKS(1400)); return;
+        ui_show_error("NO WIFI");
+        vTaskDelay(pdMS_TO_TICKS(1400));
+        upload_busy_end();
+        return;
     }
 
     /* Count clips to sync so we can show progress. */
@@ -1892,6 +1967,7 @@ static void upload_pending_clips(void)
     if (failed == 0) ui_show_uploading(100);
     else ui_show_error("NO SERVER");
     vTaskDelay(pdMS_TO_TICKS(1200));
+    upload_busy_end();
     ESP_LOGI(TAG, "Sync finished: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
 }
 
@@ -2036,7 +2112,7 @@ static void clip_menu_loop(void)
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
-        if (s_screen_on && (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
+        if (s_screen_on && !s_upload_active && (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
             screen_sleep();
             return;
         }
@@ -2097,6 +2173,10 @@ void app_main(void)
         ESP_LOGW(TAG, "PM configure failed: %s", esp_err_to_name(pm_err));
     } else {
         ESP_LOGI(TAG, "PM enabled: 160/40 MHz, auto light sleep");
+        esp_err_t lock_err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "upload", &s_upload_pm_lock);
+        if (lock_err != ESP_OK) {
+            ESP_LOGW(TAG, "upload PM lock create failed: %s", esp_err_to_name(lock_err));
+        }
     }
 
     int prev = 1, hb = 0;
@@ -2159,7 +2239,7 @@ void app_main(void)
         }
 
         /* Idle timeout: blank the LCD to prevent image retention and save power. */
-        if (s_screen_on && !s_recording_active &&
+        if (s_screen_on && !s_recording_active && !s_upload_active &&
             (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
             screen_sleep();
         }

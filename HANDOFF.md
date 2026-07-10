@@ -2,7 +2,7 @@
 
 Repo: <https://github.com/kliszaj/wordsnap>
 
-Goal: a small ESP32-C6 recorder captures Swedish words/phrases, syncs clips to Hoth/Unraid, transcribes with Whisper, enriches with Claude, and sends clean cards into Anki.
+Goal: a small ESP32-C6 recorder captures Swedish words/phrases, syncs clips to Hoth/Unraid, transcribes with Whisper, enriches with the preferred LLM provider, and sends clean cards into Anki.
 
 Current deployment target: Hoth at `10.0.0.240`.
 
@@ -87,11 +87,13 @@ Backend still uses some older internal statuses such as `needs_review`, `approve
 
 ## Important Decisions
 
-- Product name: `WordSnap` / UI title `wordclip.`
-- Enrichment provider: Claude.
+- Product name: `WordSnap` / web page title and header: `wordsnap`
+- Enrichment provider: configurable in Settings via `LLM_PROVIDER`.
+- Allowed enrichment providers are `anthropic` and `openai`; the non-preferred provider is used as fallback.
 - Claude model default: `claude-sonnet-5`.
 - Transcription: OpenAI Whisper API, default `whisper-1`.
-- GPT enrichment module is retained for A/B testing but Claude is the chosen path.
+- GPT enrichment default: `gpt-5.5`.
+- Important: transcription still requires OpenAI/Whisper when a transcript is not already supplied, even if Anthropic is the preferred enrichment provider.
 - Card style:
 
   ```text
@@ -207,7 +209,9 @@ Current firmware behavior:
 - BOOT does not start or stop recordings.
 - Max recording duration is capped.
 - Upload pill batch-syncs all valid clips.
-- Upload progress bar fills during sync and turns green on clean completion.
+- Upload percentage updates during sync and can jump directly to the latest value/100% when upload finishes quickly.
+- Upload keeps the screen awake and holds an `ESP_PM_NO_LIGHT_SLEEP` lock until sync finishes or errors.
+- Connecting state shows a centered WiFi icon with amber `CONNECTING...`.
 - Invalid/empty WAVs are skipped/deleted locally.
 - Firmware includes capture timestamp when file mtime is valid.
 - Upload response can sync device RTC from Hoth server time.
@@ -255,20 +259,24 @@ Important endpoints:
 
 Current web features:
 
-- Left clip list scrolls independently.
+- Page title/header is `wordsnap` in red; no `Hoth receiver` eyebrow.
+- Header only keeps Auto-sync and Settings; the old metric strip, Upload button, and Export CSV button are removed.
+- Settings lets the user choose Anthropic-first or OpenAI-first enrichment; the other provider is used as fallback.
+- Left snip list scrolls independently.
 - Delete snips from the side panel.
-- Audio playback for selected clip.
-- Correct transcript before translation.
-- Transcribe button under transcription step.
-- Reprocess with Claude under translation step.
-- Save to Anki under Anki step.
+- Audio playback for selected snip.
+- Two-card pipeline:
+  - `01 transcription` lets the user correct the transcript and Swedish item.
+  - Center `Sync` button processes the edited transcript/card front through Claude, then saves/syncs to Anki.
+  - `02 anki` previews the generated card front/back.
+- Translation column, Transcribe button, and Save-to-Anki button were removed from the visible pipeline.
 - Keyboard shortcuts:
   - ArrowUp / ArrowDown navigate clips.
   - Space toggles save/review internally, but this should be revisited now that the UI is Save-to-Anki first.
 - Polls while uploaded/processing clips exist.
 - Cache-busted assets in `index.html` to avoid stale Hoth browser JS:
-  - `styles.css?v=20260708-2`
-  - `app.js?v=20260708-2`
+  - `styles.css?v=20260709-7`
+  - `app.js?v=20260709-7`
 
 Known old Hoth bug and fix:
 
@@ -292,6 +300,7 @@ Expected keys/settings:
 ```text
 OPENAI_API_KEY=
 ANTHROPIC_API_KEY=
+LLM_PROVIDER=anthropic
 WHISPER_MODEL=whisper-1
 CLAUDE_MODEL=claude-sonnet-5
 GPT_MODEL=gpt-5.5
@@ -312,7 +321,7 @@ Latest pushed image from this checkpoint:
 
 ```text
 kliszaj/wordsnap:latest
-sha256:719d7d27f7edcf62181a70ebc2208cc7d7efad446d76d9c63b3c1b8c9eb4e6c3
+sha256:5f5cc44d8ee43b6c156242f5e81cc7bf5e24444cdb3cbc8c4616e6bcf526763a
 ```
 
 Local run:
@@ -367,7 +376,16 @@ Completed in the follow-up pass after the live Anki test:
 - **Auto-sync toggle** — backend + web. `AUTO_ANKI` flag (default ON) in `backend/settings.py`
   (`auto_anki_enabled()`), gates the auto-save-to-Anki step in `auto_process_clip`, plus
   `GET`/`POST /api/auto-sync`. Header toggle switch in `index.html`/`app.js`/`styles.css`, left of
-  Settings. Asset cache-buster is `?v=20260709-3`.
+  Settings. Asset cache-buster is `?v=20260709-7`.
+- **Web header/pipeline simplification** — header now says red `wordsnap`; removed `Hoth receiver`,
+  dashboard metrics, Upload, and Export CSV. Pipeline is two columns (`01 transcription`, `02 anki`)
+  with a centered `Sync` button between them. `Sync` processes the corrected transcript/front and
+  then saves/syncs to Anki. The visible Translation column, Transcribe button, and Save-to-Anki button
+  are gone.
+- **LLM provider preference + fallback** — Settings now includes `LLM_PROVIDER` (`anthropic` or
+  `openai`). `process_clip` enriches with the preferred provider first and automatically falls back to
+  the other provider if the preferred model/key/API call fails. The successful provider is stored on
+  the clip as `llm_provider`; any first-provider error is stored as `llm_fallback_error`.
 
 **Device firmware:**
 
@@ -385,8 +403,14 @@ Completed in the follow-up pass after the live Anki test:
   `preview_clip_index`, `ui_show_playback`, `ui_playback_update_levels`, `draw_play_icon`). The
   per-clip **play button is removed** from the clips view (icon + touch region gated off; clip
   label shifted left). Flip the macro to `1` to restore.
-- **Upload % animation (firmware)** — `ui_show_uploading` now tweens the big `N%` smoothly between
-  per-clip progress steps set by `upload_progress`, repainting only the number area.
+- **Upload % animation (firmware)** — `ui_show_uploading` now updates the big `N%` without forcing
+  every intermediate percent. Small changes get a short glide, large jumps and 100% draw immediately,
+  repainting only the number area.
+- **Upload keep-awake (firmware)** — sync now sets `s_upload_active`, refreshes the activity timer on
+  progress updates, blocks idle screen sleep while uploading, and holds an `ESP_PM_NO_LIGHT_SLEEP`
+  lock so PM auto light-sleep does not interrupt WiFi upload. *Built + flashed.*
+- **Connecting icon (firmware)** — the connecting view now draws a centered WiFi icon instead of the
+  old `...` dots. *Built + flashed.*
 - **Event-driven idle + light sleep, button wake (firmware)** — PM is enabled in `sdkconfig` and
   `sdkconfig.defaults`; `app_main` configures 160/40 MHz with auto light sleep. When the screen is
   off, the main loop blocks in `esp_light_sleep_start()` and wakes from the BOOT button only
@@ -398,6 +422,8 @@ Completed in the follow-up pass after the live Anki test:
   Home charging UI is a bottom row, not a corner icon: amber bolt + live `CHARGING NN%` while charging,
   green bolt + live `NN%` when USB power is present but charging is complete. The green is `#58A75D`.
   Charging/done rows clear the full bottom strip before drawing to avoid overlap. *Built + flashed.*
+- **Wake battery overlay thresholds (firmware)** — when unplugged, wake shows the battery overlay only
+  at or below 30%. Red is below 15%; amber/yellow is 15-30%; above 30% shows no battery overlay.
 
 **Planned (not started):**
 

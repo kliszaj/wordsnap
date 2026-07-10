@@ -56,14 +56,20 @@ function ankiBack(clip) {
 }
 
 function setMetrics() {
-  document.querySelector("#metric-total").textContent = String(clips.length).padStart(2, "0");
-  document.querySelector("#metric-ready").textContent = String(
+  const total = document.querySelector("#metric-total");
+  const ready = document.querySelector("#metric-ready");
+  const saved = document.querySelector("#metric-saved");
+  const pending = document.querySelector("#pending-count");
+  if (!total || !ready || !saved || !pending) return;
+
+  total.textContent = String(clips.length).padStart(2, "0");
+  ready.textContent = String(
     clips.filter((clip) => ["processed", "needs_review"].includes(clip.status)).length,
   ).padStart(2, "0");
-  document.querySelector("#metric-saved").textContent = String(
+  saved.textContent = String(
     clips.filter((clip) => ["approved", "exported"].includes(clip.status)).length,
   ).padStart(2, "0");
-  document.querySelector("#pending-count").textContent = `[${String(
+  pending.textContent = `[${String(
     clips.filter((clip) => clip.status !== "approved" && clip.status !== "exported").length,
   ).padStart(2, "0")}]`;
 }
@@ -212,19 +218,23 @@ function renderDetail() {
 
   const transcript = node.querySelector(".transcript");
   const cardFront = node.querySelector(".card-front") || node.querySelector(".corrected-word");
-  const swedish = node.querySelector(".swedish-definition");
-  const english = node.querySelector(".english-definition");
 
   transcript.value = clip.transcript || "";
   cardFront.value = clip.card_front || clip.corrected_word || "";
-  swedish.value = clip.swedish_definition || "";
-  english.value = clip.english_definition || "";
 
   node.querySelector(".front").textContent = clip.anki?.front || clip.card_front || clip.corrected_word || "Front";
   node.querySelector(".back").textContent = ankiBack(clip);
 
-  node.querySelector(".process").addEventListener("click", async () => {
-    await request(`/api/clips/${clip.id}/process`, {
+  const syncButton = node.querySelector(".pipeline-sync");
+  if (clip.status === "exported") {
+    syncButton.textContent = "Synced";
+    syncButton.disabled = true;
+  }
+
+  syncButton.addEventListener("click", async () => {
+    syncButton.disabled = true;
+    syncButton.textContent = "Syncing";
+    const processed = await request(`/api/clips/${clip.id}/process`, {
       method: "POST",
       body: JSON.stringify({
         transcript: transcript.value,
@@ -232,28 +242,10 @@ function renderDetail() {
         iso_week: clip.iso_week,
       }),
     });
-    await loadClips();
-  });
-
-  const saveButton = node.querySelector(".save-anki");
-  if (clip.status === "exported") {
-    saveButton.textContent = "Saved to Anki";
-    saveButton.disabled = true;
-  } else if (clip.status === "approved") {
-    saveButton.textContent = "Ready for CSV";
-  }
-
-  saveButton.addEventListener("click", async () => {
-    await request(`/api/clips/${clip.id}`, {
-      method: "PATCH",
-      body: JSON.stringify({
-        transcript: transcript.value,
-        card_front: cardFront.value,
-        swedish_definition: swedish.value,
-        english_definition: english.value,
-      }),
+    await request(`/api/clips/${processed.id || clip.id}/save-to-anki`, {
+      method: "POST",
+      body: JSON.stringify({}),
     });
-    await request(`/api/clips/${clip.id}/save-to-anki`, { method: "POST", body: JSON.stringify({}) });
     await loadClips();
   });
 
@@ -275,7 +267,7 @@ queueAudio.addEventListener("ended", () => {
   setQueuePlaybackState();
 });
 
-fileInput.addEventListener("change", async () => {
+fileInput?.addEventListener("change", async () => {
   for (const file of fileInput.files) {
     const form = new FormData();
     form.append("file", file);
@@ -299,6 +291,7 @@ const settingsSave = document.querySelector("#settings-save");
 const settingsMsg = document.querySelector("#settings-msg");
 const inputAnthropic = document.querySelector("#input-anthropic");
 const inputOpenai = document.querySelector("#input-openai");
+const inputLlmProvider = document.querySelector("#input-llm-provider");
 const inputClaudeModel = document.querySelector("#input-claude-model");
 const inputWhisperModel = document.querySelector("#input-whisper-model");
 const inputGptModel = document.querySelector("#input-gpt-model");
@@ -318,6 +311,7 @@ function renderSecretStatus(el, secret) {
 function renderSettings(data) {
   renderSecretStatus(statusAnthropic, data.secrets.anthropic);
   renderSecretStatus(statusOpenai, data.secrets.openai);
+  inputLlmProvider.value = data.llm_provider || "anthropic";
   inputClaudeModel.placeholder = data.models.claude.value;
   inputWhisperModel.placeholder = data.models.whisper.value;
   inputGptModel.placeholder = data.models.gpt.value;
@@ -362,6 +356,7 @@ async function saveSettings() {
   const fields = [
     [inputAnthropic, "anthropic_api_key"],
     [inputOpenai, "openai_api_key"],
+    [inputLlmProvider, "llm_provider"],
     [inputClaudeModel, "claude_model"],
     [inputWhisperModel, "whisper_model"],
     [inputGptModel, "gpt_model"],
