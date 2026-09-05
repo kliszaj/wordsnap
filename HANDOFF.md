@@ -6,6 +6,91 @@ Goal: a small ESP32-C6 recorder captures Swedish words/phrases, syncs clips to H
 
 Current deployment target: Hoth at `10.0.0.240`.
 
+## Firmware Safety, Performance, and Polish Pass (2026-07-18)
+
+Implemented and verified as part of the current repository checkpoint. The complete pass was built and flashed to COM3 with `firmware\flash.ps1`.
+
+- SD mount failures can no longer auto-format the card.
+- Recording now checks free space and every write, checkpoints a valid WAV header while capturing, flushes durably, and atomically renames `rec_NNN.part` to `.wav` only after success.
+- Boot repairs interrupted `.part` recordings from their actual file size. Non-empty files that cannot be repaired are retained.
+- Clip indexing uses a 125-byte bitmap instead of 4-5 KB stack arrays and reports `STORAGE FULL` instead of overwriting `rec_999.wav`.
+- PMIC rail/charger initialization now runs before LCD, SD, audio, and touch. Audio gets bounded clean retries; unavailable SD/audio/touch peripherals retry every five seconds while idle.
+- The onboard PCF85063 RTC restores system time at boot and is updated whenever Hoth returns server time.
+- Ordinary PWR wake uses fast panel-on. A USB/battery handoff marks the ST7789 for the proven full reset/tuning path before backlight-on.
+- Solid rectangles render in 16-line tiles, font rows render contiguous runs, and line primitives avoid per-point discs. This removes a large number of tiny synchronous SPI transfers without allocating a full framebuffer.
+- Firmware now tracks explicit Home, Recording, Saving, Snap List, Connecting, Uploading, Error, and Sleep states. Invisible Home hit zones no longer remain active over error screens.
+- Recording shows immediate `SAVING` feedback before `DONE`; the waveform is the only animated recording progress visual, while the 15-second automatic stop remains enforced without a separate red rail.
+- Snap rows show only their centered three-digit index. Delete uses a two-second soft-delete with `UNDO`; leaving the screen or expiry commits it.
+- Label pills use measured glyph bounds for centering. The 44 px Home/Upload pills give tall bracket glyphs more room, and the recording index plus Back/Undo labels are centered within their actual containers.
+- WiFi connection animates its arcs. Upload writes handle partial transport sends, invalid WAVs are retained, and completion reports sent/retry counts rather than reducing every partial failure to `NO SERVER`.
+- Charging-complete green appears only for the PMIC's actual done state, not every plugged-in noncharging condition.
+- Speaker playback was permanently removed after the hardware speaker was dropped: the ES8311/I2S output path, playback UI and touch actions, output pin definition, and stale speaker documentation are gone. The codec build now enables only the ES7210 microphone input driver.
+- Battery standby now has two levels: the screen enters quick light-sleep standby after 30 seconds, then battery-only idle requests true AXP2101 shutdown after 10 minutes. PWR polling slows from 250 ms to one second after the first minute; USB-powered operation never auto-shuts down. A short PWR press wakes quick standby or cold-boots after PMIC shutdown.
+
+Verification completed:
+
+- `idf.py build` passes with no compiler warnings.
+- The speaker-free firmware rebuilt and flashed successfully to COM3; the build compiled only the ES7210 codec driver.
+- Firmware image: `0x133e20` bytes, 18% of the smallest app partition remains.
+- DIRAM: 204,522 / 452,112 bytes (45.24%), leaving 247,590 bytes before runtime allocations.
+
+Next physical test:
+
+1. Record/stop twice and confirm `REC -> SAVING -> DONE -> Home` has no blank or clipped frame.
+2. Interrupt one recording with reset, reboot, and confirm the recovered snap appears in the numbered list.
+3. Delete a snap, test `UNDO`, then delete again and wait two seconds.
+4. Upload a mixture of valid and empty snaps and confirm valid snaps leave the card while invalid/failed ones remain with a retry result.
+5. Sleep/wake normally, then repeat across USB plug/unplug to compare fast wake versus full recovery wake.
+6. Power-cycle before WiFi sync and verify new file timestamps come from the PCF85063.
+7. Leave the unplugged device asleep for more than 10 minutes, confirm it cold-boots from one short PWR press, then run a multi-day battery-life test.
+
+## Active Firmware Robustness Pass (2026-07-13)
+
+This pass is incorporated in the current firmware robustness checkpoint.
+
+Completed and build-verified so far:
+
+- After a reported glitchy wake following a true 0%-to-full charge cycle, the PMIC setup was compared against Waveshare's official BSP. Startup now explicitly restores DC1, ALDO1, and ALDO2 to 3.3 V; a fully depleted cell can no longer leave those rails dependent on retained AXP2101 register state.
+- Every screen wake now hardware-resets and fully reinitializes the ST7789, reapplies its color/power tuning, paints the next frame with the backlight dark, and only then enables the backlight. This recovers cleanly if USB removal disturbed the LCD controller while the ESP remained alive.
+- LCD color transfers now have completion tracking. Drawing buffers are not reused until queued SPI DMA work finishes, removing a source of stray colors/lines.
+- Cold boot now keeps the backlight off through LCD initialization and turns it on only after the complete `STARTING` frame has been painted, so uninitialized panel memory is never exposed.
+- Screen sleep turns both the backlight and ST7789 display output off.
+- Wake keeps the backlight dark until the panel is enabled and the next view is fully painted.
+- The low-battery fill clamps its corner radius to the actual fill dimensions, so narrow red/amber fills stay inside the battery outline.
+- Startup failures now show `NO SD` or `NO AUDIO`; solid magenta is no longer used as an unexplained error state.
+- AXP2101 startup now enables battery detection/voltage ADC, disables unused TS sensing, and configures the 400 mAh LiPo conservatively at 200 mA charge current, 25 mA termination, and 4.20 V target.
+- Battery state is now one validated read containing presence, VBUS, charging phase, voltage, and percentage. Gauge values are cross-checked against cell voltage and filtered across plug/unplug transitions; failed reads no longer become a fake `50%`.
+- Charging UI appears only when a battery is actually detected, and both charging and completed percentages refresh when they change.
+- ES7210/I2S is now an on-demand resource: it is initialized and self-tested at boot, suspended during idle, resumed just before recording, and suspended again after the WAV closes or recording setup fails.
+- The post-record `DONE` view no longer redraws Home itself; the main event loop performs the single Home render, removing the brief black frame caused by two consecutive full-screen paints.
+- The remaining post-record blank frame was traced to Home's full-screen clear. Successful recordings now transition section-by-section from `DONE` into the Home controls, keeping visible content on screen while each region is replaced.
+- VBUS now holds a dedicated no-light-sleep PM lock. This keeps the native USB Serial/JTAG interface stable while the cable is attached without affecting battery idle behavior when unplugged.
+- `firmware/flash.ps1` provides the normal Windows flash path using ESP32-C6 `usb_reset`; no BOOT/PWR sequence is required once this firmware is installed.
+- Blank-screen idle no longer wakes every 20 ms or emits one-second heartbeat logs. It sleeps in 250 ms windows between AXP2101 PWR polls; touch is not polled while blank.
+- Long PWR shows `POWERING OFF`, suspends audio, and sends the AXP2101 hardware shutdown command (`COMMON_CONFIG` bit 0). If VBUS policy leaves the CPU running, it falls back to a recoverable panel/backlight-off state.
+- CST816 remains electrically powered because the board leaves its reset pin unmanaged and the installed driver has no supported sleep/resume implementation. It is skipped entirely while the screen is off.
+
+Connected-device status:
+
+- The explicit PMIC-rail and wake-time LCD reinitialization build compiled and flashed successfully through `firmware/flash.ps1`; physical USB-to-battery wake verification is pending.
+- The cold-start backlight fix is physically verified: the user confirmed the startup artifact is gone.
+- The section-by-section post-record transition was built and flashed successfully. Its regional repaint order now clears every overlapping area before drawing the Home record control last, preventing the lower half from being erased; physical verification is pending.
+- A second complete flash using `firmware/flash.ps1` succeeded with automatic USB reset at 460800 baud, proving future development flashes no longer require button choreography.
+- The first complete robustness build flashed successfully over normal `idf.py -p COM3 flash` and booted without LCD/PMIC/audio initialization faults.
+- Live telemetry showed AXP gauge `38%` and charging cell voltage `3934 mV`. This exposed an important policy correction: while VBUS is present the valid PMIC gauge remains authoritative because charge voltage is elevated; voltage may replace a wildly inconsistent gauge only while unplugged.
+- The final gauge-policy correction was flashed successfully through the manual bootloader path; all flash regions passed hash verification. Avoid reopening serial during visual testing because native USB serial can reset the C6 or leave `COM3` temporarily non-configurable.
+
+Physical verification checklist after the final flash:
+
+1. Home paints cleanly with no pink field, stray lines, or partial-frame artifacts.
+2. Wait 30 seconds: panel and backlight turn off. Short PWR wakes a fully painted Home frame; screen taps do not wake it.
+3. Record a snap: recording starts promptly, waveform moves, WAV saves, and Home returns without a black flash. Repeat once to prove audio resume/suspend is reusable.
+4. Unplug USB and wake: no battery overlay above 30%; amber at 15-30%; red below 15%; fill remains within its outline.
+5. Plug/unplug several times: percentage changes smoothly rather than jumping from full to empty.
+6. Long PWR: `POWERING OFF` appears, then PMIC removes processor/display power. Short PWR starts it again.
+7. Upload one snap and confirm screen stays awake and WiFi upload still completes.
+8. Measure current in Home, screen-off idle, recording, WiFi upload, and PMIC-off states before estimating final 400 mAh runtime.
+
 ---
 
 ## Status At A Glance
@@ -16,8 +101,8 @@ Current deployment target: Hoth at `10.0.0.240`.
 | SD organization | Recordings live under `/sdcard/clips/`; root recordings were auto-migrated |
 | Batch sync | Working; tap upload pill to upload all clips, progress bar turns green on clean sync |
 | Delete-on-ACK | Working; device deletes local WAV only after server 2xx ACK |
-| Empty/invalid WAV cleanup | Added in firmware and backend |
-| Burn-in protection | Idle screen sleeps after 30s and wakes on touch |
+| Empty/invalid WAV handling | Backend rejects them; firmware retains them for explicit review/delete |
+| Burn-in protection | Idle screen sleeps after 30s; only short PWR wakes it |
 | Backend on Hoth | Running at `http://10.0.0.240:8090` |
 | Web UI | Working: clip list, playback, delete, edit, transcribe, enrich, save to Anki |
 | Auto-process on upload | Added: upload ACK is fast, processing runs in the background |
@@ -175,7 +260,7 @@ Confirmed pins:
 - I2S: MCLK=19, BCLK=20, WS=22, DIN=21
 - codec I2C: SDA=7, SCL=8
 - touch I2C: shared SDA=7, SCL=8; INT=11; reset unmanaged (`-1`)
-- BOOT button: GPIO9
+- BOOT/debug button: GPIO9; user power control is the AXP2101 PWR key
 - ES7210 mic-array ADC: I2C `0x40`
 
 ESP-IDF v5.5 path:
@@ -205,16 +290,16 @@ Current firmware behavior:
 - Charging row shows amber bolt + `CHARGING NN%` while charging, green bolt + `NN%` after charge completes; both use the live AXP2101 gauge.
 - Touch red record button to record.
 - Tap recording screen to stop.
-- BOOT is power-only: press while asleep to wake, press while awake to sleep.
-- BOOT does not start or stop recordings.
+- Short PWR wakes/sleeps the screen; hold PWR for PMIC shutdown.
+- BOOT does not control recording or normal sleep/wake.
 - Max recording duration is capped.
 - Upload pill batch-syncs all valid clips.
 - Upload percentage updates during sync and can jump directly to the latest value/100% when upload finishes quickly.
 - Upload keeps the screen awake and holds an `ESP_PM_NO_LIGHT_SLEEP` lock until sync finishes or errors.
 - Connecting state shows a centered WiFi icon with amber `CONNECTING...`.
-- Invalid/empty WAVs are skipped/deleted locally.
+- Invalid/empty WAVs are retained locally for explicit review/delete.
 - Firmware includes capture timestamp when file mtime is valid.
-- Upload response can sync device RTC from Hoth server time.
+- Upload response syncs system time and persists it to the onboard PCF85063 RTC.
 
 Observed during the last hardware check:
 
@@ -321,7 +406,7 @@ Latest pushed image from this checkpoint:
 
 ```text
 kliszaj/wordsnap:latest
-sha256:5f5cc44d8ee43b6c156242f5e81cc7bf5e24444cdb3cbc8c4616e6bcf526763a
+sha256:658c72c3efc1c11fb03b2bb9851a9a01aa4c657a17fc496e6fd30f8502d45f78
 ```
 
 Local run:
@@ -397,12 +482,6 @@ Completed in the follow-up pass after the live Anki test:
   Was blanking the backlight during a slow line-by-line repaint. Now: `ui_transition_begin/end`
   are no-ops (repaint in place, backlight stays on) and `lcd_fill` paints 32-row strips
   (~284 SPI transactions → ~9). *Built + flashed + user-approved.*
-- **Speaker removal** — the ES8311 playback path never drove the NS4150B amp correctly; hardware
-  speaker is being removed. All playback/codec code is gated behind `#define SPEAKER_ENABLED 0`
-  in `firmware/main/main.c` (globals, `audio_input_deinit`/`audio_output_init`/`audio_output_deinit`,
-  `preview_clip_index`, `ui_show_playback`, `ui_playback_update_levels`, `draw_play_icon`). The
-  per-clip **play button is removed** from the clips view (icon + touch region gated off; clip
-  label shifted left). Flip the macro to `1` to restore.
 - **Upload % animation (firmware)** — `ui_show_uploading` now updates the big `N%` without forcing
   every intermediate percent. Small changes get a short glide, large jumps and 100% draw immediately,
   repainting only the number area.
@@ -411,13 +490,10 @@ Completed in the follow-up pass after the live Anki test:
   lock so PM auto light-sleep does not interrupt WiFi upload. *Built + flashed.*
 - **Connecting icon (firmware)** — the connecting view now draws a centered WiFi icon instead of the
   old `...` dots. *Built + flashed.*
-- **Event-driven idle + light sleep, button wake (firmware)** — PM is enabled in `sdkconfig` and
-  `sdkconfig.defaults`; `app_main` configures 160/40 MHz with auto light sleep. When the screen is
-  off, the main loop blocks in `esp_light_sleep_start()` and wakes from the BOOT button only
-  (`GPIO9` low-level wake). When the screen is on, BOOT puts the screen back to sleep instead of
-  acting as a recording shortcut. Touch wake while screen-off is intentionally disabled; touch remains
-  responsive while the screen is on. Deep sleep is intentionally not used because C6 deep-sleep GPIO
-  wake needs LP-GPIO 0–7, while the button is GPIO9 and touch INT is GPIO11.
+- **Low-power idle + PWR wake (firmware)** — PM is enabled in `sdkconfig` and
+  `sdkconfig.defaults`; `app_main` configures 160/40 MHz with automatic light sleep. The board does not
+  expose the AXP2101 IRQ pin, so blank-screen idle checks latched PMIC PWR events every 250 ms while
+  automatic light sleep handles the gaps. Touch wake is intentionally disabled to prevent pocket wakes.
 - **Device copy + charging state (firmware)** — on-device wording is now `SNAPS` / `SNAP` / `NO SNAP`.
   Home charging UI is a bottom row, not a corner icon: amber bolt + live `CHARGING NN%` while charging,
   green bolt + live `NN%` when USB power is present but charging is complete. The green is `#58A75D`.

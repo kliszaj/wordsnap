@@ -13,13 +13,20 @@
   --accent-dark: #8f2d24;
   --good: #58A75D;
   --warning: #FF4D4D;
-  --mono: "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", monospace;
+  --mono: "PP Fraktion Mono", "JetBrains Mono", "Cascadia Mono", "SFMono-Regular", monospace;
   --sans: "Geist", "Satoshi", "Segoe UI", system-ui, sans-serif;
   font-family: var(--sans);
 }
 
 * {
   box-sizing: border-box;
+  scrollbar-width: none;
+}
+
+*::-webkit-scrollbar {
+  display: none;
+  width: 0;
+  height: 0;
 }
 
 html {
@@ -251,21 +258,10 @@ h2 {
 
 .clip-queue {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   min-height: 0;
   border-right: 1px solid var(--line);
   background: rgba(9, 10, 11, 0.52);
-}
-
-.queue-head {
-  display: grid;
-  padding: 13px 18px;
-  border-bottom: 1px solid var(--line);
-  color: var(--muted);
-  font-family: var(--mono);
-  font-size: 11px;
-  letter-spacing: 0.12em;
-  text-transform: uppercase;
 }
 
 .clip-queue-list {
@@ -294,6 +290,14 @@ h2 {
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
+.queue-row:hover {
+  background: rgba(235, 232, 223, 0.045);
+}
+
+.queue-row.active:hover {
+  background: rgba(255, 77, 77, 0.13);
+}
+
 .queue-item {
   display: block;
   align-items: center;
@@ -311,6 +315,10 @@ h2 {
 .queue-item.active {
   background: transparent;
   color: var(--text);
+}
+
+.queue-row:hover .queue-title {
+  color: var(--accent);
 }
 
 .queue-copy {
@@ -341,6 +349,15 @@ h2 {
   inset: 4px;
   border-radius: inherit;
   background: var(--bg);
+}
+
+.queue-row:hover .queue-play::before {
+  background: var(--panel);
+}
+
+.queue-row:hover .queue-play {
+  outline: 1px solid rgba(255, 77, 77, 0.62);
+  outline-offset: 2px;
 }
 
 .queue-play-icon {
@@ -439,10 +456,9 @@ h2 {
 
 .clip {
   display: grid;
-  grid-template-rows: auto auto auto auto;
-  align-content: start;
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  min-height: 100%;
   gap: 16px;
-  min-height: 0;
   padding: 24px;
 }
 
@@ -458,12 +474,12 @@ h2 {
   color: var(--text);
   font-size: clamp(32px, 4vw, 62px);
   font-weight: 700;
-  letter-spacing: -0.07em;
+  letter-spacing: -0.035em;
   line-height: 0.92;
 }
 
 .clip-meta {
-  margin-top: 8px;
+  margin-top: 18px;
   color: var(--muted);
   font-family: var(--mono);
   font-size: 12px;
@@ -524,7 +540,7 @@ h2 {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 72px;
-  align-items: start;
+  align-items: stretch;
   min-height: 0;
 }
 
@@ -538,8 +554,7 @@ h2 {
   display: grid;
   align-content: start;
   gap: 10px;
-  min-height: 0;
-  max-height: 390px;
+  min-height: 100%;
   overflow: auto;
   padding: 16px;
   border: 1px solid var(--line-strong);
@@ -586,24 +601,45 @@ h2 {
   position: absolute;
   z-index: 2;
   left: 50%;
-  top: 184px;
-  min-height: 42px;
-  padding: 0 22px;
-  transform: translateX(-50%);
-  border-color: rgba(255, 77, 77, 0.72);
-  background: var(--accent);
-  color: #190503;
-  font-family: var(--mono);
-  font-size: 13px;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
-  box-shadow: 0 0 28px rgba(255, 77, 77, 0.18);
+  top: 50%;
+  display: grid;
+  place-items: center;
+  width: 42px;
+  height: 42px;
+  min-height: 0;
+  padding: 0;
+  transform: translate(-50%, -50%);
+  border-color: var(--line-strong);
+  background: var(--panel-3);
+  color: var(--text);
+  border-radius: 50%;
+}
+
+.pipeline-sync span {
+  display: block;
+  width: 9px;
+  height: 9px;
+  border-top: 2px solid currentColor;
+  border-right: 2px solid currentColor;
+  transform: translateX(-2px) rotate(45deg);
+}
+
+.pipeline-sync:active {
+  transform: translate(-50%, -50%) scale(0.96);
 }
 
 .pipeline-sync:disabled {
   opacity: 0.62;
   cursor: default;
-  transform: translateX(-50%);
+  transform: translate(-50%, -50%);
+}
+
+.pipeline-sync.syncing span {
+  animation: pipeline-chevron-pulse 0.8s ease-in-out infinite alternate;
+}
+
+@keyframes pipeline-chevron-pulse {
+  to { transform: translateX(2px) rotate(45deg); }
 }
 
 label {
@@ -798,6 +834,13 @@ textarea {
   text-transform: uppercase;
 }
 
+.settings-help {
+  margin: -4px 0 12px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
 .settings-status {
   font-style: normal;
   font-size: 11px;
@@ -845,7 +888,7 @@ textarea {
     position: relative;
     left: auto;
     top: auto;
-    justify-self: stretch;
+    justify-self: center;
     transform: none;
   }
 

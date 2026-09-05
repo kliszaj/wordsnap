@@ -37,10 +37,13 @@ function isTypingTarget(target) {
   return ["INPUT", "TEXTAREA", "SELECT", "BUTTON", "A", "AUDIO"].includes(target.tagName) || target.isContentEditable;
 }
 
-function clipNumber(clip, index) {
-  const match = clip.original_name?.match(/(\d{3,})/);
-  if (match) return match[1].slice(-3);
-  return String(index + 1).padStart(3, "0");
+function uploadedDateTime(clip) {
+  const uploadedAt = new Date(clip.uploaded_at);
+  if (Number.isNaN(uploadedAt.getTime())) return "Unknown upload time";
+  return new Intl.DateTimeFormat("sv-SE", {
+    dateStyle: "short",
+    timeStyle: "short",
+  }).format(uploadedAt).replace(",", "");
 }
 
 function clipFront(clip) {
@@ -157,14 +160,14 @@ function renderQueue() {
     return;
   }
 
-  clips.forEach((clip, index) => {
+  clips.forEach((clip) => {
     const node = queueTemplate.content.firstElementChild.cloneNode(true);
     node.dataset.clipId = clip.id;
     const item = node.querySelector(".queue-item");
     node.classList.toggle("active", clip.id === selectedClipId);
     item.classList.toggle("active", clip.id === selectedClipId);
     node.querySelector(".queue-title").textContent = clipFront(clip);
-    node.querySelector(".queue-meta").textContent = `SNIP ${clipNumber(clip, index)}`;
+    node.querySelector(".queue-meta").textContent = uploadedDateTime(clip);
     const playButton = node.querySelector(".queue-play");
     playButton.addEventListener("click", async (event) => {
       event.stopPropagation();
@@ -208,7 +211,7 @@ function renderDetail() {
 
   const node = detailTemplate.content.firstElementChild.cloneNode(true);
   node.querySelector(".clip-title").textContent = clipFront(clip);
-  node.querySelector(".clip-meta").textContent = `${clip.original_name} · ${clip.iso_week || "unsorted"}`;
+  node.querySelector(".clip-meta").textContent = uploadedDateTime(clip);
   const status = node.querySelector(".status");
   status.className = statusClass(clip.status);
   status.textContent = statusLabel(clip.status);
@@ -226,27 +229,35 @@ function renderDetail() {
   node.querySelector(".back").textContent = ankiBack(clip);
 
   const syncButton = node.querySelector(".pipeline-sync");
-  if (clip.status === "exported") {
-    syncButton.textContent = "Synced";
-    syncButton.disabled = true;
-  }
+  syncButton.setAttribute("aria-label", "Update Anki card from this transcription");
+  syncButton.title = "Update Anki card from this transcription";
 
   syncButton.addEventListener("click", async () => {
     syncButton.disabled = true;
-    syncButton.textContent = "Syncing";
-    const processed = await request(`/api/clips/${clip.id}/process`, {
-      method: "POST",
-      body: JSON.stringify({
-        transcript: transcript.value,
-        card_front: cardFront.value,
-        iso_week: clip.iso_week,
-      }),
-    });
-    await request(`/api/clips/${processed.id || clip.id}/save-to-anki`, {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    await loadClips();
+    syncButton.setAttribute("aria-label", "Syncing to Anki");
+    syncButton.title = "Syncing to Anki";
+    syncButton.classList.add("syncing");
+    try {
+      const processed = await request(`/api/clips/${clip.id}/process`, {
+        method: "POST",
+        body: JSON.stringify({
+          transcript: transcript.value,
+          card_front: cardFront.value,
+          iso_week: clip.iso_week,
+        }),
+      });
+      await request(`/api/clips/${processed.id || clip.id}/save-to-anki`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+      await loadClips();
+    } catch (error) {
+      syncButton.disabled = false;
+      syncButton.classList.remove("syncing");
+      syncButton.setAttribute("aria-label", "Update Anki card from this transcription");
+      syncButton.title = "Update Anki card from this transcription";
+      node.querySelector(".error").textContent = `Could not update Anki: ${error.message}`;
+    }
   });
 
   node.querySelector(".error").textContent = clip.error || clip.anki_sync_error || "";

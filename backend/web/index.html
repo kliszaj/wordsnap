@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>wordsnap</title>
-    <link rel="stylesheet" href="/assets/styles.css?v=20260709-7" />
+    <link rel="stylesheet" href="/assets/styles.css?v=20260905-1" />
   </head>
   <body>
     <main class="shell">
@@ -25,9 +25,6 @@
       <section class="review-board" aria-label="Snip review ledger">
         <div class="workbench">
           <aside class="clip-queue" aria-label="Snip queue">
-            <div class="queue-head">
-              <span>snip</span>
-            </div>
             <div id="clip-queue-list" class="clip-queue-list" aria-live="polite"></div>
           </aside>
           <section id="clip-detail" class="clip-detail" aria-live="polite"></section>
@@ -62,26 +59,28 @@
         </fieldset>
 
         <fieldset class="settings-group">
-          <legend>Models (optional overrides)</legend>
+          <legend>Card model</legend>
           <label class="settings-field">
-            <span class="settings-label">LLM provider</span>
+            <span class="settings-label">Preferred card model</span>
             <select id="input-llm-provider">
-              <option value="anthropic">Anthropic first, OpenAI fallback</option>
-              <option value="openai">OpenAI first, Anthropic fallback</option>
+              <option value="anthropic">Claude Sonnet 5 (GPT-5.5 fallback)</option>
+              <option value="openai">GPT-5.5 (Claude Sonnet 5 fallback)</option>
             </select>
           </label>
+          <p class="settings-help">Used to turn the transcript into the Swedish explanation, English meaning, and Anki card.</p>
           <label class="settings-field">
-            <span class="settings-label">Claude model</span>
+            <span class="settings-label">Claude model override</span>
             <input type="text" id="input-claude-model" autocomplete="off" spellcheck="false" />
           </label>
           <label class="settings-field">
-            <span class="settings-label">Whisper model</span>
-            <input type="text" id="input-whisper-model" autocomplete="off" spellcheck="false" />
-          </label>
-          <label class="settings-field">
-            <span class="settings-label">GPT model (lab compare)</span>
+            <span class="settings-label">GPT model override</span>
             <input type="text" id="input-gpt-model" autocomplete="off" spellcheck="false" />
           </label>
+          <label class="settings-field">
+            <span class="settings-label">Whisper transcription model</span>
+            <input type="text" id="input-whisper-model" autocomplete="off" spellcheck="false" />
+          </label>
+          <p class="settings-help">Whisper is an OpenAI model and always handles audio-to-text before the preferred card model runs.</p>
         </fieldset>
 
         <fieldset class="settings-group">
@@ -124,13 +123,12 @@
     </template>
 
     <template id="detail-template">
-      <article class="clip">
-        <div class="clip-top">
-          <div>
-            <p class="eyebrow">Selected snip</p>
-            <div class="clip-title"></div>
-            <div class="clip-meta"></div>
-          </div>
+          <article class="clip">
+            <div class="clip-top">
+              <div>
+                <div class="clip-title"></div>
+                <div class="clip-meta"></div>
+              </div>
           <span class="status"></span>
         </div>
 
@@ -154,7 +152,9 @@
             </label>
           </section>
 
-          <button class="pipeline-sync" type="button">Sync</button>
+          <button class="pipeline-sync" type="button" aria-label="Process and save to Anki" title="Process and save to Anki">
+            <span aria-hidden="true"></span>
+          </button>
 
           <section class="tape-card">
             <div class="card-head">
@@ -177,6 +177,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260709-7"></script>
+    <script src="/assets/app.js?v=20260710-4"></script>
   </body>
 </html>

@@ -13,4 +13,18 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 
 # Power management: allow automatic light sleep between polling ticks.
 CONFIG_PM_ENABLE=y
+CONFIG_CODEC_ES7210_SUPPORT=y
+# CONFIG_CODEC_ES8311_SUPPORT is not set
+# CONFIG_CODEC_ES7243_SUPPORT is not set
+# CONFIG_CODEC_ES7243E_SUPPORT is not set
+# CONFIG_CODEC_ES8156_SUPPORT is not set
+# CONFIG_CODEC_AW88298_SUPPORT is not set
+# CONFIG_CODEC_ES8389_SUPPORT is not set
+# CONFIG_CODEC_ES8374_SUPPORT is not set
+# CONFIG_CODEC_ES8388_SUPPORT is not set
+# CONFIG_CODEC_TAS5805M_SUPPORT is not set
 CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# Keep the CPU powered in light sleep. This costs a small amount of idle current,
+# but avoids the CPU-context power-down path that has stranded the screen after
+# very long idle periods on this device.
+CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP=n

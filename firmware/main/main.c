@@ -6,7 +6,8 @@
  *   - Home view: upload pill + large red record button
  *   - Recording view: dark dotted field + stop-capable capture
  *   - microSD (FAT32) over shared SPI2 bus
- *   - Capacitive touch starts/stops recording; BOOT (GPIO9) wakes/sleeps the screen
+ *   - Touch controls the active UI; the physical PWR button wakes/blanks the LCD.
+ *     BOOT remains available only for startup/debug.
  *
  * Audio: ES7210 4-ch ADC (we use MIC1+MIC2), I2S TDM 2-slot, 16 kHz / 16-bit stereo.
  * Pins (schematic Rev1.2 + Waveshare examples):
@@ -19,14 +20,15 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
 #include <strings.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "driver/gpio.h"
 #include "driver/spi_common.h"
-#include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
 #include "driver/i2c_master.h"
 #include "esp_lcd_panel_io.h"
@@ -39,10 +41,10 @@
 #include "esp_codec_dev.h"
 #include "esp_codec_dev_defaults.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_check.h"
 #include "esp_timer.h"
 #include "esp_pm.h"
-#include "esp_sleep.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_event.h"
@@ -63,10 +65,33 @@ static const char *TAG = "wordclip";
 #define PIN_LCD_RST 4
 #define PIN_LCD_BL  6
 #define PIN_SD_CS   17
-#define PIN_BTN     9          /* BOOT button, active-low */
 #define PIN_TOUCH_INT 11
 #define PIN_TOUCH_RST -1       /* Waveshare example leaves CST816 reset unmanaged; GPIO4 is LCD reset */
 #define AXP2101_ADDR 0x34
+#define AXP2101_STATUS1 0x00
+#define AXP2101_STATUS2 0x01
+#define AXP2101_COMMON_CONFIG 0x10
+#define AXP2101_ADC_CTRL 0x30
+#define AXP2101_BAT_V_H 0x34
+#define AXP2101_BAT_V_L 0x35
+#define AXP2101_INTEN2 0x41
+#define AXP2101_INTSTS2 0x49
+#define AXP2101_TS_PIN_CTRL 0x50
+#define AXP2101_PRECHARGE 0x61
+#define AXP2101_CHARGE_CURRENT 0x62
+#define AXP2101_TERMINATION 0x63
+#define AXP2101_TARGET_VOLTAGE 0x64
+#define AXP2101_BAT_DETECT 0x68
+#define AXP2101_DC_ONOFF 0x80
+#define AXP2101_DC1_VOLTAGE 0x82
+#define AXP2101_LDO_ONOFF0 0x90
+#define AXP2101_ALDO1_VOLTAGE 0x92
+#define AXP2101_ALDO2_VOLTAGE 0x93
+#define AXP2101_BAT_PERCENT 0xA4
+#define AXP2101_PKEY_LONG  (1 << 2)
+#define AXP2101_PKEY_SHORT (1 << 3)
+#define PCF85063_ADDR 0x51
+#define PCF85063_SECONDS_REG 0x04
 
 #define LCD_HOST    SPI2_HOST
 #define LCD_H_RES   240
@@ -82,7 +107,6 @@ static const char *TAG = "wordclip";
 #define PIN_I2S_BCLK    20
 #define PIN_I2S_WS      22
 #define PIN_I2S_DIN     21
-#define PIN_I2S_DOUT    23
 
 #define SAMPLE_RATE     16000                 /* Whisper-native */
 #define SAMPLE_BITS     I2S_DATA_BIT_WIDTH_16BIT
@@ -92,28 +116,27 @@ static const char *TAG = "wordclip";
 #define MAX_RECORD_SECONDS 15
 #define MIN_RECORD_MS      600
 #define SCREEN_IDLE_MS     30000       /* blank the LCD after this idle time (retention + power) */
+#define PKEY_FAST_POLL_MS   250         /* responsive PWR wake just after the screen blanks */
+#define PKEY_SLOW_POLL_MS   1000        /* AXP events latch, so later polling can be much slower */
+#define PKEY_FAST_WINDOW_MS 60000
+#define AUTO_POWER_OFF_MS   (10 * 60 * 1000) /* true PMIC-off standby after 10 minutes on battery */
+#define AUTO_POWER_RETRY_MS 60000
 #define WAKE_BATTERY_MS     2000
 #define CHARGE_CHECK_MS     5000
-
-/* On-device speaker preview is disabled: the ES8311 playback path never drove the
- * NS4150B amp correctly and the hardware speaker is being removed. All playback,
- * ES8311 codec init, and the per-clip play button are gated off here. Flip to 1
- * to bring the preview path (and play button) back. */
-#define SPEAKER_ENABLED 0
+#define RECORDING_RESERVE_BYTES (64 * 1024)
+#define CLIP_BITMAP_BYTES   125
 
 /* ---- RGB565 colors (byte-swapped at fill time for ST7789-over-SPI) ---- */
 #define C_WHITE   0xFFFF
 #define C_RED     0xFA69   /* #FF4D4D in RGB565 */
 #define C_GREEN   0x5D2B   /* #58A75D in RGB565 */
 #define C_AMBER   0xDD65
-#define C_MAGENTA 0xF81F
 #define C_BG       0x1082
 #define C_PANEL    0x18E3
 #define C_TEXT     0xBDBD
 #define C_MUTED    0xA514
 #define C_DOT      0x39E7
 #define C_DARK_RED 0xA145
-#define C_BLACK    0x0000
 #define C_BLUE     0x001F
 #define C_LINE     0x31A6
 #define C_RING     0x0861
@@ -121,45 +144,90 @@ static const char *TAG = "wordclip";
 #define C_CHARCOAL C_BG
 
 static esp_lcd_panel_handle_t s_panel = NULL;
+static esp_lcd_panel_io_handle_t s_panel_io = NULL;
+static SemaphoreHandle_t s_lcd_tx_done = NULL;
 static esp_lcd_panel_io_handle_t s_touch_io = NULL;
 static esp_lcd_touch_handle_t s_touch = NULL;
 static i2c_master_bus_handle_t s_i2c_bus = NULL;
 static i2c_master_dev_handle_t s_axp = NULL;
+static i2c_master_dev_handle_t s_rtc = NULL;
 static bool s_sd_ok = false;
+static sdmmc_card_t *s_sd_card = NULL;
+static bool s_audio_ok = false;
+static bool s_touch_ok = false;
 static i2s_chan_handle_t s_i2s_rx = NULL;
 static esp_codec_dev_handle_t s_codec = NULL;
+static bool s_audio_open = false;
 static const audio_codec_ctrl_if_t *s_rec_ctrl_if = NULL;
 static const audio_codec_data_if_t *s_rec_data_if = NULL;
 static const audio_codec_if_t *s_rec_codec_if = NULL;
-#if SPEAKER_ENABLED
-static i2s_chan_handle_t s_i2s_tx = NULL;
-static esp_codec_dev_handle_t s_play_codec = NULL;
-static const audio_codec_ctrl_if_t *s_play_ctrl_if = NULL;
-static const audio_codec_data_if_t *s_play_data_if = NULL;
-static const audio_codec_gpio_if_t *s_play_gpio_if = NULL;
-static const audio_codec_if_t *s_play_codec_if = NULL;
-#endif
 static int s_active_clip_index = 0;
 static bool s_recording_active = false;
 static bool s_touch_was_down = false;
 static bool s_screen_on = true;
 static bool s_upload_active = false;
 static int64_t s_last_activity_ms = 0;
+static int64_t s_next_pkey_poll_ms = 0;
+static int64_t s_screen_sleep_started_ms = 0;
+static int64_t s_next_auto_poweroff_attempt_ms = 0;
+static int64_t s_ignore_pkey_short_until_ms = 0;
 static char s_timer_prev[6] = "";
 static int s_wave_x = 0;
 static int s_upload_prev_pct = -1;
 static bool s_upload_prev_done = false;
 static esp_pm_lock_handle_t s_upload_pm_lock = NULL;
 static bool s_upload_pm_lock_held = false;
+static esp_pm_lock_handle_t s_usb_pm_lock = NULL;
+static bool s_usb_pm_lock_held = false;
+static int64_t s_next_usb_pm_check_ms = 0;
 static int s_home_charge_state = -1;
 static int s_home_charge_pct = -1;
 static int64_t s_next_charge_check_ms = 0;
+static int s_filtered_battery_pct = -1;
+static bool s_last_battery_vbus = false;
+static bool s_battery_mismatch_logged = false;
+static bool s_panel_needs_reinit = true;
+static bool s_last_known_vbus = false;
+static int64_t s_next_peripheral_retry_ms = 0;
+static int64_t s_next_sd_health_ms = 0;
+static bool s_trash_pending = false;
+static char s_trash_path[96] = "";
+static char s_trash_restore_path[96] = "";
+static int64_t s_trash_deadline_ms = 0;
+
+typedef enum {
+    UI_STATE_STARTING = 0,
+    UI_STATE_HOME,
+    UI_STATE_RECORDING,
+    UI_STATE_SAVING,
+    UI_STATE_SNAP_LIST,
+    UI_STATE_CONNECTING,
+    UI_STATE_UPLOADING,
+    UI_STATE_ERROR,
+    UI_STATE_SLEEP,
+} device_ui_state_t;
+
+static device_ui_state_t s_ui_state = UI_STATE_STARTING;
+
+typedef struct {
+    bool valid;
+    bool present;
+    bool vbus;
+    bool charging;
+    bool charge_done;
+    int percent;
+    int millivolts;
+    uint8_t charge_state;
+} battery_info_t;
 
 static inline uint16_t sw16(uint16_t c) { return (uint16_t)((c >> 8) | (c << 8)); }
 
 static int next_index(void);
 static int pending_clip_count(void);
 static bool parse_clip_index(const char *name, int *index);
+static void audio_suspend(void);
+static esp_err_t lcd_panel_reinitialize(void);
+static void ui_set_state(device_ui_state_t state);
 
 typedef enum {
     TOUCH_ACTION_NONE = 0,
@@ -167,7 +235,36 @@ typedef enum {
     TOUCH_ACTION_CLIPS,
 } touch_action_t;
 
+static void ui_set_state(device_ui_state_t state)
+{
+    if (s_ui_state == state) return;
+    ESP_LOGD(TAG, "UI state %d -> %d", s_ui_state, state);
+    s_ui_state = state;
+}
+
 /* ---------------- LCD ---------------- */
+static bool lcd_color_transfer_done(esp_lcd_panel_io_handle_t panel_io,
+                                    esp_lcd_panel_io_event_data_t *event_data,
+                                    void *user_ctx)
+{
+    (void)panel_io;
+    (void)event_data;
+    (void)user_ctx;
+    BaseType_t higher_priority_task_woken = pdFALSE;
+    xSemaphoreGiveFromISR(s_lcd_tx_done, &higher_priority_task_woken);
+    return higher_priority_task_woken == pdTRUE;
+}
+
+static void lcd_wait_transfers(int count)
+{
+    for (int i = 0; i < count; i++) {
+        if (xSemaphoreTake(s_lcd_tx_done, pdMS_TO_TICKS(1000)) != pdTRUE) {
+            ESP_LOGE(TAG, "LCD transfer completion timeout (%d/%d)", i, count);
+            break;
+        }
+    }
+}
+
 static void lcd_fill(uint16_t color)
 {
     /* Paint in multi-line strips: one SPI transaction per strip instead of one
@@ -177,18 +274,18 @@ static void lcd_fill(uint16_t color)
     static uint16_t buf[LCD_H_RES * FILL_STRIP];
     uint16_t v = sw16(color);
     for (int i = 0; i < LCD_H_RES * FILL_STRIP; i++) buf[i] = v;
+    int transfers = 0;
     for (int y = 0; y < LCD_V_RES; y += FILL_STRIP) {
         int h = (LCD_V_RES - y < FILL_STRIP) ? (LCD_V_RES - y) : FILL_STRIP;
-        esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + h, buf);
+        if (esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y + h, buf) == ESP_OK) {
+            transfers++;
+        }
     }
+    lcd_wait_transfers(transfers);
 }
 
-/* Transitions used to blank the backlight while the new view painted, but the
- * SPI paint is slow enough that the blanked window read as an ugly black flash.
- * Every view shares the C_BG background, so we now repaint in place with the
- * backlight on: the old view is overwritten by a quick C_BG sweep and the new
- * elements draw straight on top — no black interstitial. */
-static void ui_transition_begin(void) { }
+/* Normal in-app transitions repaint in place. Physical wake is handled
+ * separately and keeps the backlight dark until the first frame is complete. */
 static void ui_transition_end(void) { }
 
 static void ui_transition_fill(uint16_t color)
@@ -204,19 +301,27 @@ static void lcd_rect(int x0, int y0, int x1, int y1, uint16_t color)
     if (y1 > LCD_V_RES) y1 = LCD_V_RES;
     if (x1 <= x0 || y1 <= y0) return;
 
-    static uint16_t row[LCD_H_RES];
+    enum { RECT_STRIP = 16 };
+    static uint16_t tile[LCD_H_RES * RECT_STRIP];
     uint16_t v = sw16(color);
     int w = x1 - x0;
-    for (int x = 0; x < w; x++) row[x] = v;
-    for (int y = y0; y < y1; y++) {
-        esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, row);
+    int max_pixels = w * RECT_STRIP;
+    for (int i = 0; i < max_pixels; i++) tile[i] = v;
+    int transfers = 0;
+    for (int y = y0; y < y1; y += RECT_STRIP) {
+        int h = y1 - y < RECT_STRIP ? y1 - y : RECT_STRIP;
+        if (esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + h, tile) == ESP_OK) {
+            transfers++;
+        }
     }
+    lcd_wait_transfers(transfers);
 }
 
 static void lcd_disc(int cx, int cy, int r, uint16_t color)
 {
     static uint16_t row[LCD_H_RES];
     uint16_t v = sw16(color);
+    int transfers = 0;
     for (int y = cy - r; y <= cy + r; y++) {
         if (y < 0 || y >= LCD_V_RES) continue;
         int dy = y - cy;
@@ -228,8 +333,11 @@ static void lcd_disc(int cx, int cy, int r, uint16_t color)
         if (x1 > LCD_H_RES) x1 = LCD_H_RES;
         int w = x1 - x0;
         for (int x = 0; x < w; x++) row[x] = v;
-        if (w > 0) esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, row);
+        if (w > 0 && esp_lcd_panel_draw_bitmap(s_panel, x0, y, x1, y + 1, row) == ESP_OK) {
+            transfers++;
+        }
     }
+    lcd_wait_transfers(transfers);
 }
 
 static void lcd_circle_outline(int cx, int cy, int r, int thickness, uint16_t color)
@@ -240,6 +348,10 @@ static void lcd_circle_outline(int cx, int cy, int r, int thickness, uint16_t co
 
 static void lcd_round_rect_fill(int x, int y, int w, int h, int r, uint16_t color)
 {
+    if (w <= 0 || h <= 0) return;
+    int max_r = (w < h ? w : h) / 2;
+    if (r > max_r) r = max_r;
+    if (r < 0) r = 0;
     lcd_rect(x + r, y, x + w - r, y + h, color);
     lcd_rect(x, y + r, x + w, y + h - r, color);
     lcd_disc(x + r, y + r, r, color);
@@ -257,15 +369,26 @@ static void lcd_round_rect_outline(int x, int y, int w, int h, int r, int thickn
 
 static void lcd_line(int x0, int y0, int x1, int y1, int thickness, uint16_t color)
 {
-    int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
-    int dy = -abs(y1 - y0), sy = y0 < y1 ? 1 : -1;
-    int err = dx + dy;
-    while (1) {
-        lcd_disc(x0, y0, thickness / 2, color);
-        if (x0 == x1 && y0 == y1) break;
-        int e2 = 2 * err;
-        if (e2 >= dy) { err += dy; x0 += sx; }
-        if (e2 <= dx) { err += dx; y0 += sy; }
+    int radius = thickness > 1 ? thickness / 2 : 0;
+    if (y0 == y1) {
+        if (x0 > x1) { int t = x0; x0 = x1; x1 = t; }
+        lcd_rect(x0, y0 - radius, x1 + 1, y0 + radius + 1, color);
+        return;
+    }
+    if (x0 == x1) {
+        if (y0 > y1) { int t = y0; y0 = y1; y1 = t; }
+        lcd_rect(x0 - radius, y0, x0 + radius + 1, y1 + 1, color);
+        return;
+    }
+
+    if (y0 > y1) {
+        int tx = x0, ty = y0;
+        x0 = x1; y0 = y1; x1 = tx; y1 = ty;
+    }
+    int dy = y1 - y0;
+    for (int y = y0; y <= y1; y++) {
+        int x = x0 + (x1 - x0) * (y - y0) / dy;
+        lcd_rect(x - radius, y, x + radius + 1, y + 1, color);
     }
 }
 
@@ -344,12 +467,18 @@ static void draw_font_text(const ui_glyph_t *glyphs, int count, const uint8_t *b
         if (!g) continue;
         int row_bytes = (g->w + 7) / 8;
         for (int yy = 0; yy < g->h; yy++) {
-            for (int xx = 0; xx < g->w; xx++) {
+            int xx = 0;
+            while (xx < g->w) {
                 uint8_t byte = bitmap[g->offset + yy * row_bytes + xx / 8];
-                if (byte & (1 << (7 - (xx % 8)))) {
-                    lcd_rect(x + xx + g->xoff, y + yy + g->yoff,
-                             x + xx + g->xoff + 1, y + yy + g->yoff + 1, color);
+                if (!(byte & (1 << (7 - (xx % 8))))) { xx++; continue; }
+                int run = xx;
+                while (xx < g->w) {
+                    byte = bitmap[g->offset + yy * row_bytes + xx / 8];
+                    if (!(byte & (1 << (7 - (xx % 8))))) break;
+                    xx++;
                 }
+                lcd_rect(x + run + g->xoff, y + yy + g->yoff,
+                         x + xx + g->xoff, y + yy + g->yoff + 1, color);
             }
         }
         x += g->advance;
@@ -361,9 +490,37 @@ static int label_width(const char *s)
     return font_text_width(ui_label_glyphs, UI_LABEL_GLYPH_COUNT, s);
 }
 
+static void label_ink_size(const char *s, int *width, int *height)
+{
+    int pen_x = 0;
+    int right = 0;
+    int bottom = 0;
+    for (const char *p = s; *p; p++) {
+        const ui_glyph_t *g = font_lookup(ui_label_glyphs, UI_LABEL_GLYPH_COUNT, *p);
+        if (!g) continue;
+        if (g->w > 0 && pen_x + g->xoff + g->w > right) {
+            right = pen_x + g->xoff + g->w;
+        }
+        if (g->h > 0 && g->yoff + g->h > bottom) {
+            bottom = g->yoff + g->h;
+        }
+        pen_x += g->advance;
+    }
+    *width = right;
+    *height = bottom;
+}
+
 static void draw_label_text(int x, int y, const char *s, uint16_t color)
 {
     draw_font_text(ui_label_glyphs, UI_LABEL_GLYPH_COUNT, ui_label_bitmap, x, y, s, color);
+}
+
+static void draw_label_centered(int x, int y, int w, int h, const char *s, uint16_t color)
+{
+    int text_w = 0;
+    int text_h = 0;
+    label_ink_size(s, &text_w, &text_h);
+    draw_label_text(x + (w - text_w) / 2, y + (h - text_h) / 2, s, color);
 }
 
 static int big_width(const char *s)
@@ -393,10 +550,11 @@ static void draw_status(int y, uint16_t dot_color, const char *label)
 
 static void draw_clip_pill(int clip_index)
 {
+    const int x = 174, y = 228, w = 44, h = 28;
     char buf[4];
     snprintf(buf, sizeof(buf), "%02d", clip_index % 100);
-    lcd_round_rect_fill(174, 228, 44, 28, 14, C_TEXT);
-    draw_label_text(190, 235, buf, C_BG);
+    lcd_round_rect_fill(x, y, w, h, h / 2, C_TEXT);
+    draw_label_centered(x, y, w, h, buf, C_BG);
 }
 
 static void format_time_value(uint32_t elapsed_ms, char out[6])
@@ -419,19 +577,25 @@ static void draw_face(void)
 
 static void draw_pill_button(int y, const char *label, bool enabled)
 {
-    int w = label_width(label) + 36;
+    const int h = 44;
+    int text_w = 0, text_h = 0;
+    label_ink_size(label, &text_w, &text_h);
+    int w = text_w + 44;
     int x = (LCD_H_RES - w) / 2;
     uint16_t color = enabled ? C_TEXT : C_DISABLED;
-    lcd_round_rect_outline(x, y, w, 38, 19, 1, color, C_BG);
-    draw_label_text(x + 18, y + 11, label, color);
+    lcd_round_rect_outline(x, y, w, h, h / 2, 1, color, C_BG);
+    draw_label_centered(x, y, w, h, label, color);
 }
 
 static void draw_pill_pressed(int y, const char *label)
 {
-    int w = label_width(label) + 36;
+    const int h = 44;
+    int text_w = 0, text_h = 0;
+    label_ink_size(label, &text_w, &text_h);
+    int w = text_w + 44;
     int x = (LCD_H_RES - w) / 2;
-    lcd_round_rect_fill(x, y, w, 38, 19, C_TEXT);
-    draw_label_text(x + 18, y + 11, label, C_BG);
+    lcd_round_rect_fill(x, y, w, h, h / 2, C_TEXT);
+    draw_label_centered(x, y, w, h, label, C_BG);
     vTaskDelay(pdMS_TO_TICKS(45));
 }
 
@@ -470,10 +634,35 @@ static void ui_show_battery(int pct)
     lcd_round_rect_outline(x, y, w, h, 16, 3, C_TEXT, C_BG);
     lcd_round_rect_fill(x + w + 4, y + 22, 7, 18, 2, C_TEXT);
     int fill_w = (w - 10) * pct / 100;
-    if (fill_w < 8) fill_w = 8;
-    uint16_t fill = pct < 15 ? C_RED : C_AMBER;
-    lcd_round_rect_fill(x + 5, y + 5, fill_w, h - 10, 11, fill);
+    if (fill_w > w - 10) fill_w = w - 10;
+    if (fill_w > 0) {
+        uint16_t fill = pct < 15 ? C_RED : C_AMBER;
+        lcd_round_rect_fill(x + 5, y + 5, fill_w, h - 10, 11, fill);
+    }
     ui_transition_end();
+}
+
+static void ui_show_power_message(const char *label, uint16_t color)
+{
+    const char *name = "WORDSNAP";
+    ui_transition_fill(C_BG);
+    draw_big_text((LCD_H_RES - big_width(name)) / 2, 105, name, C_TEXT);
+    draw_status(230, color, label);
+    ui_transition_end();
+}
+
+static esp_err_t shared_i2c_init(void)
+{
+    if (s_i2c_bus) return ESP_OK;
+    i2c_master_bus_config_t cfg = {
+        .i2c_port = I2C_PORT,
+        .sda_io_num = PIN_I2C_SDA,
+        .scl_io_num = PIN_I2C_SCL,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    return i2c_new_master_bus(&cfg, &s_i2c_bus);
 }
 
 static bool axp_ready(void)
@@ -489,37 +678,249 @@ static bool axp_ready(void)
     return i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_axp) == ESP_OK;
 }
 
-static int battery_percent(void)
+static bool axp_read_reg(uint8_t reg, uint8_t *value)
 {
-    if (!axp_ready()) return 50;
-    uint8_t reg = 0xA4, pct = 0;
-    if (i2c_master_transmit_receive(s_axp, &reg, 1, &pct, 1, 100) != ESP_OK) return 50;
-    if (pct > 100) return 50;
-    return pct;
+    return axp_ready() &&
+           i2c_master_transmit_receive(s_axp, &reg, 1, value, 1, 100) == ESP_OK;
 }
 
-static bool axp_vbus_good(void)
+static bool axp_write_reg(uint8_t reg, uint8_t value)
 {
-    if (!axp_ready()) return true;
-    uint8_t reg = 0x00, status = 0;
-    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return true;
-    return (status & (1 << 5)) != 0;  /* AXP2101 reg00H[5] = VBUS_GOOD */
+    uint8_t data[] = {reg, value};
+    return axp_ready() && i2c_master_transmit(s_axp, data, sizeof(data), 100) == ESP_OK;
 }
 
-static bool axp_power_present(void)
+static bool axp_update_reg(uint8_t reg, uint8_t clear_mask, uint8_t set_mask)
 {
-    if (!axp_ready()) return false;
-    uint8_t reg = 0x00, status = 0;
-    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return false;
-    return (status & (1 << 5)) != 0;
+    uint8_t value = 0;
+    return axp_read_reg(reg, &value) &&
+           axp_write_reg(reg, (value & (uint8_t)~clear_mask) | set_mask);
 }
 
-static bool axp_is_charging(void)
+static uint8_t bcd_encode(int value)
 {
-    if (!axp_ready()) return false;
-    uint8_t reg = 0x01, status = 0;
-    if (i2c_master_transmit_receive(s_axp, &reg, 1, &status, 1, 100) != ESP_OK) return false;
-    return (status >> 5) == 0x01;
+    return (uint8_t)(((value / 10) << 4) | (value % 10));
+}
+
+static int bcd_decode(uint8_t value)
+{
+    return ((value >> 4) & 0x0F) * 10 + (value & 0x0F);
+}
+
+static bool rtc_ready(void)
+{
+    if (!s_i2c_bus) return false;
+    if (s_rtc) return true;
+    i2c_device_config_t cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = PCF85063_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    return i2c_master_bus_add_device(s_i2c_bus, &cfg, &s_rtc) == ESP_OK;
+}
+
+static bool rtc_set_utc(time_t epoch)
+{
+    if (!rtc_ready() || epoch < 1704067200) return false;
+    struct tm utc = {0};
+    gmtime_r(&epoch, &utc);
+    uint8_t data[] = {
+        PCF85063_SECONDS_REG,
+        bcd_encode(utc.tm_sec), bcd_encode(utc.tm_min), bcd_encode(utc.tm_hour),
+        bcd_encode(utc.tm_mday), bcd_encode(utc.tm_wday),
+        bcd_encode(utc.tm_mon + 1), bcd_encode((utc.tm_year + 1900) % 100),
+    };
+    return i2c_master_transmit(s_rtc, data, sizeof(data), 100) == ESP_OK;
+}
+
+static bool rtc_restore_system_time(void)
+{
+    if (!rtc_ready()) return false;
+    uint8_t reg = PCF85063_SECONDS_REG;
+    uint8_t data[7] = {0};
+    if (i2c_master_transmit_receive(s_rtc, &reg, 1, data, sizeof(data), 100) != ESP_OK) return false;
+    if (data[0] & 0x80) return false;
+    struct tm utc = {
+        .tm_sec = bcd_decode(data[0] & 0x7F),
+        .tm_min = bcd_decode(data[1] & 0x7F),
+        .tm_hour = bcd_decode(data[2] & 0x3F),
+        .tm_mday = bcd_decode(data[3] & 0x3F),
+        .tm_wday = bcd_decode(data[4] & 0x07),
+        .tm_mon = bcd_decode(data[5] & 0x1F) - 1,
+        .tm_year = bcd_decode(data[6]) + 100,
+        .tm_isdst = 0,
+    };
+    if (utc.tm_year < 124 || utc.tm_mon < 0 || utc.tm_mon > 11 || utc.tm_mday < 1 || utc.tm_mday > 31) {
+        return false;
+    }
+    time_t epoch = mktime(&utc);
+    if (epoch < 1704067200) return false;
+    struct timeval tv = {.tv_sec = epoch, .tv_usec = 0};
+    settimeofday(&tv, NULL);
+    ESP_LOGI(TAG, "system time restored from PCF85063");
+    return true;
+}
+
+static void axp_init_battery(void)
+{
+    bool ok = true;
+    /* A fully depleted battery can reset retained PMIC state. Restore the board
+     * rails explicitly so the USB-to-battery handoff uses Waveshare's BSP
+     * voltages instead of whatever register values happened to survive. */
+    ok &= axp_write_reg(AXP2101_DC1_VOLTAGE, 0x12); /* DC1: 3.3 V */
+    ok &= axp_update_reg(AXP2101_ALDO1_VOLTAGE, 0x1F, 0x1C); /* ALDO1: 3.3 V */
+    ok &= axp_update_reg(AXP2101_ALDO2_VOLTAGE, 0x1F, 0x1C); /* ALDO2: 3.3 V */
+    ok &= axp_update_reg(AXP2101_DC_ONOFF, 0, (1 << 0));
+    ok &= axp_update_reg(AXP2101_LDO_ONOFF0, 0, (1 << 0) | (1 << 1));
+
+    /* This board has no battery thermistor on TS. Leaving TS measurement active
+     * can inhibit charging, so match the Waveshare reference configuration. */
+    ok &= axp_update_reg(AXP2101_TS_PIN_CTRL, 0x0F, 0x10);
+    ok &= axp_update_reg(AXP2101_ADC_CTRL, (1 << 1), (1 << 0));
+    ok &= axp_update_reg(AXP2101_BAT_DETECT, 0, (1 << 0));
+
+    /* Conservative settings for the installed 400 mAh single-cell LiPo:
+     * 50 mA precharge, 200 mA constant current, 25 mA termination, 4.20 V. */
+    ok &= axp_update_reg(AXP2101_PRECHARGE, 0x03, 0x02);
+    ok &= axp_update_reg(AXP2101_CHARGE_CURRENT, 0x1F, 0x08);
+    ok &= axp_update_reg(AXP2101_TERMINATION, 0x1F, 0x11);
+    ok &= axp_update_reg(AXP2101_TARGET_VOLTAGE, 0x07, 0x03);
+
+    if (ok) ESP_LOGI(TAG, "AXP2101 3.3 V rails + battery ADC + 200 mA charger configured");
+    else ESP_LOGW(TAG, "AXP2101 battery configuration incomplete");
+}
+
+static void axp_enable_pkey_events(void)
+{
+    uint8_t enabled = 0;
+    const uint8_t mask = AXP2101_PKEY_LONG | AXP2101_PKEY_SHORT;
+    if (!axp_read_reg(AXP2101_INTEN2, &enabled) ||
+        !axp_write_reg(AXP2101_INTEN2, enabled | mask) ||
+        !axp_write_reg(AXP2101_INTSTS2, mask)) {
+        ESP_LOGW(TAG, "could not enable PWR button events from AXP2101");
+        return;
+    }
+    ESP_LOGI(TAG, "AXP2101 PWR short/long button events enabled");
+}
+
+static uint8_t axp_take_pkey_events(void)
+{
+    uint8_t status = 0;
+    const uint8_t mask = AXP2101_PKEY_LONG | AXP2101_PKEY_SHORT;
+    if (!axp_read_reg(AXP2101_INTSTS2, &status)) return 0;
+    status &= mask;
+    if (status && !axp_write_reg(AXP2101_INTSTS2, status)) {
+        ESP_LOGW(TAG, "could not clear AXP2101 PWR event");
+    }
+    return status;
+}
+
+static bool axp_shutdown(void)
+{
+    uint8_t config = 0;
+    return axp_read_reg(AXP2101_COMMON_CONFIG, &config) &&
+           axp_write_reg(AXP2101_COMMON_CONFIG, config | (1 << 0));
+}
+
+static int battery_percent_from_voltage(int millivolts)
+{
+    static const int mv[]  = {3300, 3500, 3600, 3700, 3750, 3800, 3850, 3900, 4000, 4100, 4200};
+    static const int pct[] = {   0,    5,   10,   20,   30,   45,   60,   70,   85,   95,  100};
+    if (millivolts <= mv[0]) return 0;
+    for (size_t i = 1; i < sizeof(mv) / sizeof(mv[0]); i++) {
+        if (millivolts <= mv[i]) {
+            return pct[i - 1] +
+                   (millivolts - mv[i - 1]) * (pct[i] - pct[i - 1]) / (mv[i] - mv[i - 1]);
+        }
+    }
+    return 100;
+}
+
+static int battery_filter_percent(int candidate, bool vbus)
+{
+    if (candidate < 0 || candidate > 100) return -1;
+    if (s_filtered_battery_pct < 0) {
+        s_filtered_battery_pct = candidate;
+    } else {
+        int delta = candidate - s_filtered_battery_pct;
+        int max_step = (vbus == s_last_battery_vbus) ? 5 : 10;
+        if (delta > max_step) delta = max_step;
+        if (delta < -max_step) delta = -max_step;
+        s_filtered_battery_pct += delta;
+    }
+    s_last_battery_vbus = vbus;
+    return s_filtered_battery_pct;
+}
+
+static battery_info_t battery_read(void)
+{
+    battery_info_t info = {.percent = -1, .millivolts = -1};
+    uint8_t status1 = 0, status2 = 0;
+    if (!axp_read_reg(AXP2101_STATUS1, &status1) ||
+        !axp_read_reg(AXP2101_STATUS2, &status2)) return info;
+
+    info.valid = true;
+    info.present = (status1 & (1 << 3)) != 0;
+    info.vbus = (status1 & (1 << 5)) != 0;
+    info.charge_state = status2 & 0x07;
+    info.charging = info.present && info.vbus &&
+                    (((status2 >> 5) == 0x01) ||
+                     (info.charge_state >= 1 && info.charge_state <= 3));
+    info.charge_done = info.present && info.vbus && info.charge_state == 4;
+    if (!info.present) return info;
+
+    uint8_t high = 0, low = 0, raw_pct = 0;
+    bool voltage_valid = axp_read_reg(AXP2101_BAT_V_H, &high) &&
+                         axp_read_reg(AXP2101_BAT_V_L, &low);
+    if (voltage_valid) {
+        info.millivolts = ((high & 0x1F) << 8) | low;
+        voltage_valid = info.millivolts >= 2800 && info.millivolts <= 4500;
+        if (!voltage_valid) info.millivolts = -1;
+    }
+
+    bool gauge_valid = axp_read_reg(AXP2101_BAT_PERCENT, &raw_pct) && raw_pct <= 100;
+    int voltage_pct = voltage_valid ? battery_percent_from_voltage(info.millivolts) : -1;
+    int candidate = gauge_valid ? raw_pct : voltage_pct;
+    bool mismatch = gauge_valid && voltage_valid && abs((int)raw_pct - voltage_pct) > 35;
+    if (mismatch) {
+        /* Charge voltage is elevated by the charger and is not a reliable SoC
+         * estimate. Use voltage to reject a wild gauge value only on battery. */
+        if (!info.vbus) candidate = voltage_pct;
+        if (!s_battery_mismatch_logged) {
+            ESP_LOGW(TAG, "battery gauge mismatch: raw=%u voltage=%dmV (~%d%%), using %s",
+                     raw_pct, info.millivolts, voltage_pct, info.vbus ? "gauge" : "voltage");
+            s_battery_mismatch_logged = true;
+        }
+    } else {
+        s_battery_mismatch_logged = false;
+    }
+    info.percent = battery_filter_percent(candidate, info.vbus);
+    return info;
+}
+
+static void usb_pm_poll(int64_t now_ms, bool force)
+{
+    if (!s_usb_pm_lock || (!force && now_ms < s_next_usb_pm_check_ms)) return;
+    s_next_usb_pm_check_ms = now_ms + 1000;
+
+    uint8_t status1 = 0;
+    if (!axp_read_reg(AXP2101_STATUS1, &status1)) return;
+    bool vbus = (status1 & (1 << 5)) != 0;
+    if (vbus != s_last_known_vbus) {
+        s_last_known_vbus = vbus;
+        s_panel_needs_reinit = true;
+    }
+    if (vbus == s_usb_pm_lock_held) return;
+
+    esp_err_t err = vbus ? esp_pm_lock_acquire(s_usb_pm_lock)
+                         : esp_pm_lock_release(s_usb_pm_lock);
+    if (err == ESP_OK) {
+        s_usb_pm_lock_held = vbus;
+        ESP_LOGI(TAG, "USB power %s; automatic light sleep %s",
+                 vbus ? "connected" : "removed", vbus ? "paused" : "available");
+    } else {
+        ESP_LOGW(TAG, "USB PM lock update failed: %s", esp_err_to_name(err));
+    }
 }
 
 static void draw_charge_bolt_at(int ox, int oy, uint16_t color)
@@ -617,15 +1018,13 @@ static void ui_home_poll_charge_indicator(int64_t now_ms)
     if (now_ms < s_next_charge_check_ms) return;
     int state = 0;
     int pct = -1;
-    if (axp_power_present()) {
-        pct = battery_percent();
-        if (axp_is_charging()) {
-            state = 1;
-        } else {
-            state = 2;
-        }
+    battery_info_t battery = battery_read();
+    if (battery.valid && battery.present && battery.vbus && battery.percent >= 0) {
+        pct = battery.percent;
+        if (battery.charging) state = 1;
+        else if (battery.charge_done) state = 2;
     }
-    if (state != s_home_charge_state || (state == 1 && pct != s_home_charge_pct)) {
+    if (state != s_home_charge_state || (state != 0 && pct != s_home_charge_pct)) {
         ui_home_charge_indicator(state, pct);
     }
     s_next_charge_check_ms = now_ms + CHARGE_CHECK_MS;
@@ -633,6 +1032,7 @@ static void ui_home_poll_charge_indicator(int64_t now_ms)
 
 static void ui_show_home(void)
 {
+    ui_set_state(UI_STATE_HOME);
     ui_transition_fill(C_BG);
     draw_clips_pill(pending_clip_count());
     lcd_disc(120, 180, 67, C_RING);
@@ -647,6 +1047,29 @@ static void ui_show_home(void)
     ESP_LOGI(TAG, "UI home: pending=%d", pending_clip_count());
 }
 
+static void ui_show_home_after_recording(void)
+{
+    ui_set_state(UI_STATE_HOME);
+    /* Preserve visible content while rebuilding Home. A full-screen background
+     * fill exposes a blank frame because the button and type take longer to
+     * draw; replacing one section at a time keeps the transition continuous. */
+    lcd_rect(0, 0, LCD_H_RES, 116, C_BG);
+    draw_clips_pill(pending_clip_count());
+
+    lcd_rect(0, 200, LCD_H_RES, LCD_V_RES, C_BG);
+    lcd_rect(0, 116, LCD_H_RES, 200, C_BG);
+    lcd_disc(120, 180, 67, C_RING);
+    lcd_circle_outline(120, 180, 59, 3, C_PANEL);
+    lcd_disc(120, 180, 47, C_RED);
+
+    s_home_charge_state = -1;
+    s_home_charge_pct = -1;
+    ui_home_poll_charge_indicator(0);
+    s_next_charge_check_ms = (esp_timer_get_time() / 1000) + CHARGE_CHECK_MS;
+
+    ESP_LOGI(TAG, "UI home after recording: pending=%d", pending_clip_count());
+}
+
 static void ui_home_record_pressed(void)
 {
     lcd_disc(120, 180, 67, C_RING);
@@ -656,16 +1079,6 @@ static void ui_home_record_pressed(void)
     lcd_disc(120, 180, 50, C_RED);
     vTaskDelay(pdMS_TO_TICKS(25));
 }
-
-#if SPEAKER_ENABLED
-static void draw_play_icon(int cx, int cy, uint16_t color)
-{
-    for (int row = -10; row <= 10; row++) {
-        int half = 10 - abs(row);
-        lcd_line(cx - 5, cy + row, cx - 5 + half, cy + row, 1, color);
-    }
-}
-#endif
 
 static void draw_x_icon(int cx, int cy, uint16_t color)
 {
@@ -700,16 +1113,24 @@ static void draw_icon_button(int x, int y, int w, int h, bool enabled, bool down
     else draw_up_icon(x + w / 2, y + h / 2, color);
 }
 
-static void draw_back_button(void)
+static void draw_back_button(bool pressed)
 {
-    const char *label = "BACK";
+    const char *label = s_trash_pending ? "UNDO" : "BACK";
+    uint16_t color = s_trash_pending ? C_AMBER : C_TEXT;
     int x = 78, y = 250, w = 84, h = 30;
-    lcd_round_rect_outline(x, y, w, h, h / 2, 1, C_TEXT, C_BG);
-    draw_label_text(x + (w - label_width(label)) / 2, y + 7, label, C_TEXT);
+    if (pressed) {
+        lcd_round_rect_fill(x, y, w, h, h / 2, color);
+        draw_label_centered(x, y, w, h, label, C_BG);
+        vTaskDelay(pdMS_TO_TICKS(45));
+    } else {
+        lcd_round_rect_outline(x, y, w, h, h / 2, 1, color, C_BG);
+        draw_label_centered(x, y, w, h, label, color);
+    }
 }
 
 static void ui_show_clip_menu(const int *indices, int visible, int total, int offset)
 {
+    ui_set_state(UI_STATE_SNAP_LIST);
     ui_transition_fill(C_BG);
     draw_upload_pill(total);
 
@@ -719,22 +1140,17 @@ static void ui_show_clip_menu(const int *indices, int visible, int total, int of
 
     for (int i = 0; i < visible; i++) {
         int y = 70 + i * 64;
-        char label[16];
-        snprintf(label, sizeof(label), "SNAP %03d", indices[i]);
+        char label[4];
+        snprintf(label, sizeof(label), "%03d", indices[i]);
         lcd_rect(18, y + 58, 222, y + 59, C_LINE);
-#if SPEAKER_ENABLED
-        draw_play_icon(33, y + 29, C_TEXT);
-        draw_label_text(58, y + 22, label, C_TEXT);
-#else
-        draw_label_text(30, y + 22, label, C_TEXT);
-#endif
+        draw_label_centered(30, y, 48, 58, label, C_TEXT);
         draw_x_icon(210, y + 29, C_RED);
     }
 
     bool can_up = offset > 0;
     bool can_down = offset + visible < total;
     draw_icon_button(20, 250, 44, 30, can_up, false);
-    draw_back_button();
+    draw_back_button(false);
     draw_icon_button(176, 250, 44, 30, can_down, true);
     ui_transition_end();
 }
@@ -765,6 +1181,7 @@ static void ui_recording_enter_animation(void)
 
 static void ui_recording_draw_static(bool clear_screen)
 {
+    ui_set_state(UI_STATE_RECORDING);
     if (clear_screen) lcd_fill(C_BG);
     lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
     draw_status(231, C_RED, "REC");
@@ -809,33 +1226,6 @@ static void ui_recording_update_levels(uint8_t level)
     if (s_wave_x + bar_w >= right) s_wave_x = left;
 }
 
-#if SPEAKER_ENABLED
-static void ui_playback_update_levels(uint32_t frame)
-{
-    const int left = 0;
-    const int right = LCD_H_RES;
-    const int base = 198;
-    const int top = 116;
-    const int step = 6;
-    const int bar_w = 4;
-    int x = s_wave_x;
-    if (x < left || x + bar_w >= right) x = left;
-
-    lcd_rect(x, top, x + step + bar_w, base, C_BG);
-    lcd_rect(x, base - 1, x + step + bar_w, base, C_LINE);
-
-    int phase = (frame * 7 + x / step * 5) % 28;
-    int folded = phase < 14 ? phase : 28 - phase;
-    int h = 14 + folded * 4;
-    if ((frame + x / step) % 5 == 0) h += 18;
-    if (h > base - top) h = base - top;
-    lcd_rect(x, base - h, x + bar_w, base, C_TEXT);
-
-    s_wave_x += step;
-    if (s_wave_x + bar_w >= right) s_wave_x = left;
-}
-#endif
-
 static void ui_show_recording(uint32_t elapsed_ms)
 {
     memset(s_timer_prev, 0, sizeof(s_timer_prev));
@@ -850,34 +1240,31 @@ static void ui_show_recording(uint32_t elapsed_ms)
     ESP_LOGI(TAG, "UI recording: clip=%03d elapsed=%" PRIu32 "ms pct=%d", s_active_clip_index, elapsed_ms, pct);
 }
 
-#if SPEAKER_ENABLED
-static void ui_show_playback(int clip_index, uint32_t elapsed_ms)
-{
-    memset(s_timer_prev, 0, sizeof(s_timer_prev));
-    s_wave_x = 0;
-    ui_transition_fill(C_BG);
-    lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
-    draw_status(231, C_GREEN, "PLAY");
-    draw_clip_pill(clip_index);
-    ui_transition_end();
-    ui_recording_update_time(elapsed_ms);
-    lcd_rect(0, 116, LCD_H_RES, 198, C_BG);
-    lcd_rect(0, 197, LCD_H_RES, 198, C_LINE);
-}
-#endif
-
 static void ui_show_saved(uint32_t elapsed_ms)
 {
+    ui_set_state(UI_STATE_SAVING);
     ui_recording_update_time(elapsed_ms);
     lcd_rect(0, 124, LCD_H_RES, 198, C_BG);
     lcd_rect(0, 198, LCD_H_RES, 200, C_LINE);
-    draw_status(235, C_GREEN, "DONE");
     draw_clip_pill(s_active_clip_index);
+    for (int radius = 7; radius <= 13; radius += 3) {
+        lcd_circle_outline(27, 242, radius, 2, C_GREEN);
+        vTaskDelay(pdMS_TO_TICKS(35));
+    }
+    draw_status(235, C_GREEN, "DONE");
     vTaskDelay(pdMS_TO_TICKS(900));
-    ui_show_home();
 }
 
-static void draw_wifi_icon(uint16_t color)
+static void ui_show_saving(uint32_t elapsed_ms)
+{
+    ui_set_state(UI_STATE_SAVING);
+    ui_recording_update_time(elapsed_ms);
+    lcd_rect(0, 220, LCD_H_RES, LCD_V_RES, C_BG);
+    draw_status(235, C_AMBER, "SAVING");
+    draw_clip_pill(s_active_clip_index);
+}
+
+static void draw_wifi_icon_stage(int stage)
 {
     static const int outer[][2] = {
         {58, 124}, {78, 107}, {101, 98}, {120, 96}, {139, 98}, {162, 107}, {182, 124},
@@ -888,26 +1275,51 @@ static void draw_wifi_icon(uint16_t color)
     static const int inner[][2] = {
         {100, 164}, {110, 156}, {120, 153}, {130, 156}, {140, 164},
     };
+    lcd_rect(48, 86, 192, 192, C_BG);
+    uint16_t outer_color = stage >= 3 ? C_TEXT : C_DISABLED;
+    uint16_t middle_color = stage >= 2 ? C_TEXT : C_DISABLED;
+    uint16_t inner_color = stage >= 1 ? C_TEXT : C_DISABLED;
     for (int i = 0; i < (int)(sizeof(outer) / sizeof(outer[0])) - 1; i++) {
-        lcd_line(outer[i][0], outer[i][1], outer[i + 1][0], outer[i + 1][1], 6, color);
+        lcd_line(outer[i][0], outer[i][1], outer[i + 1][0], outer[i + 1][1], 6, outer_color);
     }
     for (int i = 0; i < (int)(sizeof(middle) / sizeof(middle[0])) - 1; i++) {
-        lcd_line(middle[i][0], middle[i][1], middle[i + 1][0], middle[i + 1][1], 6, color);
+        lcd_line(middle[i][0], middle[i][1], middle[i + 1][0], middle[i + 1][1], 6, middle_color);
     }
     for (int i = 0; i < (int)(sizeof(inner) / sizeof(inner[0])) - 1; i++) {
-        lcd_line(inner[i][0], inner[i][1], inner[i + 1][0], inner[i + 1][1], 6, color);
+        lcd_line(inner[i][0], inner[i][1], inner[i + 1][0], inner[i + 1][1], 6, inner_color);
     }
-    lcd_disc(120, 179, 8, color);
+    lcd_disc(120, 179, 8, inner_color);
 }
 
 static void ui_show_connecting(void)
 {
+    ui_set_state(UI_STATE_CONNECTING);
     ui_transition_fill(C_BG);
-    draw_wifi_icon(C_TEXT);
+    draw_wifi_icon_stage(0);
     draw_status(230, C_AMBER, "CONNECTING...");
     ui_transition_end();
     s_upload_prev_pct = -1;
     s_upload_prev_done = false;
+}
+
+static void ui_show_upload_result(int sent, int retry)
+{
+    ui_set_state(retry > 0 ? UI_STATE_ERROR : UI_STATE_UPLOADING);
+    ui_transition_fill(C_BG);
+    char total[8];
+    snprintf(total, sizeof(total), "%d", sent);
+    draw_big_text((LCD_H_RES - big_width(total)) / 2, 102, total, C_TEXT);
+    char sent_label[16];
+    snprintf(sent_label, sizeof(sent_label), "%d SENT", sent);
+    draw_label_text((LCD_H_RES - label_width(sent_label)) / 2, 184, sent_label, C_TEXT);
+    if (retry > 0) {
+        char label[20];
+        snprintf(label, sizeof(label), "%d RETRY", retry);
+        draw_status(230, C_AMBER, label);
+    } else {
+        draw_status(230, C_GREEN, "DONE");
+    }
+    ui_transition_end();
 }
 
 static void ui_draw_upload_percent(int pct)
@@ -920,6 +1332,7 @@ static void ui_draw_upload_percent(int pct)
 
 static void ui_show_uploading(int pct)
 {
+    ui_set_state(UI_STATE_UPLOADING);
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
 
@@ -951,6 +1364,7 @@ static void ui_show_uploading(int pct)
 
 static void ui_show_error(const char *label)
 {
+    ui_set_state(UI_STATE_ERROR);
     ui_transition_fill(C_BG);
     draw_face();
     draw_status(230, C_RED, label);
@@ -992,37 +1406,91 @@ static void upload_busy_end(void)
 /* ---------------- Screen power (idle blank to avoid LCD image retention) ---------------- */
 static void screen_sleep(void)
 {
-    lcd_fill(C_BLACK);              /* rest the pixels (no static red held) */
-    gpio_set_level(PIN_LCD_BL, 0);  /* backlight off saves power on the LiPo */
+    bool entering_sleep = s_screen_on;
+    gpio_set_level(PIN_LCD_BL, 0);
+    esp_err_t err = esp_lcd_panel_disp_on_off(s_panel, false);
+    if (err != ESP_OK) ESP_LOGW(TAG, "panel sleep failed: %s", esp_err_to_name(err));
     s_screen_on = false;
-    ESP_LOGI(TAG, "screen sleep (idle)");
+    if (entering_sleep || s_screen_sleep_started_ms == 0) {
+        s_screen_sleep_started_ms = esp_timer_get_time() / 1000;
+        s_next_auto_poweroff_attempt_ms = s_screen_sleep_started_ms + AUTO_POWER_OFF_MS;
+    }
+    ui_set_state(UI_STATE_SLEEP);
+    ESP_LOGI(TAG, "screen and backlight off");
 }
 
 static void screen_wake(void)
 {
-    gpio_set_level(PIN_LCD_BL, 1);
-    if (!axp_vbus_good()) {
-        int pct = battery_percent();
-        if (pct <= 30) {
-            ui_show_battery(pct);
+    gpio_set_level(PIN_LCD_BL, 0);
+    esp_err_t err = ESP_OK;
+    if (s_panel_needs_reinit) {
+        err = lcd_panel_reinitialize();
+    } else {
+        err = esp_lcd_panel_disp_on_off(s_panel, true);
+        if (err != ESP_OK) {
+            s_panel_needs_reinit = true;
+            err = lcd_panel_reinitialize();
+        }
+    }
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "panel wake failed: %s", esp_err_to_name(err));
+        ui_set_state(UI_STATE_ERROR);
+        s_screen_on = false;
+        return;
+    }
+    battery_info_t battery = battery_read();
+    if (battery.valid && battery.present && !battery.vbus) {
+        if (battery.percent >= 0 && battery.percent <= 30) {
+            ui_show_battery(battery.percent);
+            gpio_set_level(PIN_LCD_BL, 1);
             vTaskDelay(pdMS_TO_TICKS(WAKE_BATTERY_MS));
+            gpio_set_level(PIN_LCD_BL, 0);
         }
     }
     ui_show_home();
+    gpio_set_level(PIN_LCD_BL, 1);
     s_touch_was_down = false;
     s_screen_on = true;
+    s_screen_sleep_started_ms = 0;
+    s_next_auto_poweroff_attempt_ms = 0;
     s_last_activity_ms = esp_timer_get_time() / 1000;
     ESP_LOGI(TAG, "screen wake");
 }
 
-static void wait_for_button_release(void)
+static void handle_pkey_events(int64_t now_ms)
 {
-    int64_t start_ms = esp_timer_get_time() / 1000;
-    while (gpio_get_level(PIN_BTN) == 0) {
-        if ((esp_timer_get_time() / 1000) - start_ms > 1500) break;
-        vTaskDelay(pdMS_TO_TICKS(20));
+    if (now_ms < s_next_pkey_poll_ms) return;
+    s_next_pkey_poll_ms = now_ms + PKEY_FAST_POLL_MS;
+
+    uint8_t events = axp_take_pkey_events();
+    if (!events) return;
+
+    if (events & AXP2101_PKEY_LONG) {
+        s_ignore_pkey_short_until_ms = now_ms + 1200;
+        if (s_screen_on) {
+            ui_show_power_message("POWERING OFF", C_AMBER);
+        }
+        audio_suspend();
+        vTaskDelay(pdMS_TO_TICKS(650));
+        ESP_LOGI(TAG, "PWR long press: requesting AXP2101 shutdown");
+        if (!axp_shutdown()) {
+            ESP_LOGE(TAG, "AXP2101 shutdown request failed; using screen-off fallback");
+            screen_sleep();
+        } else {
+            /* The PMIC normally removes the processor rails immediately. If
+             * VBUS policy keeps them up, leave a recoverable low-power screen-off
+             * state instead of stranding the shutdown message. */
+            vTaskDelay(pdMS_TO_TICKS(500));
+            screen_sleep();
+        }
+        return;
     }
-    vTaskDelay(pdMS_TO_TICKS(80));
+
+    if ((events & AXP2101_PKEY_SHORT) && now_ms >= s_ignore_pkey_short_until_ms &&
+        !s_recording_active && !s_upload_active) {
+        if (s_screen_on) screen_sleep();
+        else screen_wake();
+    }
 }
 
 /* ---------------- Touch (CST816D/CST816S-compatible controller) ---------------- */
@@ -1036,6 +1504,19 @@ static bool hit_disc(uint16_t x, uint16_t y, int cx, int cy, int r)
     int dx = (int)x - cx;
     int dy = (int)y - cy;
     return (dx * dx + dy * dy) <= (r * r);
+}
+
+static void touch_deinit(void)
+{
+    if (s_touch) {
+        esp_lcd_touch_del(s_touch);
+        s_touch = NULL;
+    }
+    if (s_touch_io) {
+        esp_lcd_panel_io_del(s_touch_io);
+        s_touch_io = NULL;
+    }
+    s_touch_was_down = false;
 }
 
 static esp_err_t touch_init(void)
@@ -1116,13 +1597,49 @@ static touch_action_t touch_home_action(void)
     return TOUCH_ACTION_NONE;
 }
 
+static esp_err_t lcd_panel_reinitialize(void)
+{
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(s_panel), TAG, "panel reset");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_init(s_panel), TAG, "panel init");
+
+    /* Reapply tuning after every reset. An interrupted power handoff may leave
+     * the ST7789 alive but back at its power-on register defaults. */
+    static const struct { uint8_t cmd; uint8_t len; uint8_t data[14]; } st7789_tune[] = {
+        {0xB2, 5, {0x0C, 0x0C, 0x00, 0x33, 0x33}},
+        {0xB7, 1, {0x35}},
+        {0xBB, 1, {0x19}},
+        {0xC0, 1, {0x2C}},
+        {0xC2, 1, {0x01}},
+        {0xC3, 1, {0x12}},
+        {0xC4, 1, {0x20}},
+        {0xC6, 1, {0x0F}},
+        {0xD0, 2, {0xA4, 0xA1}},
+        {0xE0, 14, {0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F,
+                    0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23}},
+        {0xE1, 14, {0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F,
+                    0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23}},
+    };
+    for (size_t i = 0; i < sizeof(st7789_tune) / sizeof(st7789_tune[0]); i++) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_io_tx_param(s_panel_io, st7789_tune[i].cmd,
+                                                       st7789_tune[i].data, st7789_tune[i].len),
+                            TAG, "panel tuning");
+    }
+
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(s_panel, true), TAG, "panel invert");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(s_panel, true), TAG, "panel display on");
+    s_panel_needs_reinit = false;
+    return ESP_OK;
+}
+
 static esp_err_t lcd_init(void)
 {
     gpio_config_t bl = { .pin_bit_mask = 1ULL << PIN_LCD_BL, .mode = GPIO_MODE_OUTPUT };
     ESP_ERROR_CHECK(gpio_config(&bl));
-    gpio_set_level(PIN_LCD_BL, 1);
+    gpio_set_level(PIN_LCD_BL, 0);
 
-    esp_lcd_panel_io_handle_t io = NULL;
+    s_lcd_tx_done = xSemaphoreCreateCounting(LCD_V_RES + 32, 0);
+    ESP_RETURN_ON_FALSE(s_lcd_tx_done != NULL, ESP_ERR_NO_MEM, TAG, "LCD completion semaphore");
+
     esp_lcd_panel_io_spi_config_t io_cfg = {
         .cs_gpio_num = PIN_LCD_CS,
         .dc_gpio_num = PIN_LCD_DC,
@@ -1132,76 +1649,60 @@ static esp_err_t lcd_init(void)
         .lcd_cmd_bits = 8,
         .lcd_param_bits = 8,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &io),
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST, &io_cfg, &s_panel_io),
                         TAG, "panel io");
+
+    esp_lcd_panel_io_callbacks_t io_callbacks = {
+        .on_color_trans_done = lcd_color_transfer_done,
+    };
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_io_register_event_callbacks(s_panel_io, &io_callbacks, NULL),
+                        TAG, "panel callbacks");
 
     esp_lcd_panel_dev_config_t panel_cfg = {
         .reset_gpio_num = PIN_LCD_RST,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(io, &panel_cfg, &s_panel), TAG, "st7789");
-
-    ESP_ERROR_CHECK(esp_lcd_panel_reset(s_panel));
-    ESP_ERROR_CHECK(esp_lcd_panel_init(s_panel));
-
-    /* Contrast/color tuning. The generic esp_lcd ST7789 init leaves the panel at
-     * its power-on register defaults, which look washed out (light grays, grey
-     * "blacks", flat color). Push the standard Waveshare ST7789 VCOM/power/gamma
-     * values for deeper blacks and more saturated color. Safe to send post-init.
-     * If blacks still look grey, raise VCOMS (0xBB) toward 0x28. */
-    static const struct { uint8_t cmd; uint8_t len; uint8_t data[14]; } st7789_tune[] = {
-        {0xB2, 5, {0x0C, 0x0C, 0x00, 0x33, 0x33}},              /* PORCTRL   */
-        {0xB7, 1, {0x35}},                                      /* GCTRL     */
-        {0xBB, 1, {0x19}},                                      /* VCOMS (black level) */
-        {0xC0, 1, {0x2C}},                                      /* LCMCTRL   */
-        {0xC2, 1, {0x01}},                                      /* VDVVRHEN  */
-        {0xC3, 1, {0x12}},                                      /* VRHS (contrast) */
-        {0xC4, 1, {0x20}},                                      /* VDVS      */
-        {0xC6, 1, {0x0F}},                                      /* FRCTRL2 (~60Hz) */
-        {0xD0, 2, {0xA4, 0xA1}},                                /* PWCTRL1   */
-        {0xE0, 14, {0xD0, 0x04, 0x0D, 0x11, 0x13, 0x2B, 0x3F,
-                    0x54, 0x4C, 0x18, 0x0D, 0x0B, 0x1F, 0x23}}, /* + gamma   */
-        {0xE1, 14, {0xD0, 0x04, 0x0C, 0x11, 0x13, 0x2C, 0x3F,
-                    0x44, 0x51, 0x2F, 0x1F, 0x1F, 0x20, 0x23}}, /* - gamma   */
-    };
-    for (size_t i = 0; i < sizeof(st7789_tune) / sizeof(st7789_tune[0]); i++) {
-        ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io, st7789_tune[i].cmd,
-                                                  st7789_tune[i].data, st7789_tune[i].len));
-    }
-
-    ESP_ERROR_CHECK(esp_lcd_panel_invert_color(s_panel, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
-    return ESP_OK;
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_st7789(s_panel_io, &panel_cfg, &s_panel), TAG, "st7789");
+    return lcd_panel_reinitialize();
 }
 
 /* ---------------- SD ---------------- */
 static bool sd_mount(void)
 {
+    if (s_sd_card) return true;
     sdmmc_host_t host = SDSPI_HOST_DEFAULT();
     host.slot = LCD_HOST;
     sdspi_device_config_t slot = SDSPI_DEVICE_CONFIG_DEFAULT();
     slot.gpio_cs = PIN_SD_CS;
     slot.host_id = LCD_HOST;
     esp_vfs_fat_sdmmc_mount_config_t mcfg = {
-        .format_if_mount_failed = true,
+        /* Never format automatically in production. A transient contact or
+         * brownout must not erase recordings that have not reached Hoth. */
+        .format_if_mount_failed = false,
         .max_files = 5,
         .allocation_unit_size = 16 * 1024,
     };
-    sdmmc_card_t *card = NULL;
-    esp_err_t err = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mcfg, &card);
+    esp_err_t err = esp_vfs_fat_sdspi_mount(MOUNT_POINT, &host, &slot, &mcfg, &s_sd_card);
     if (err != ESP_OK) {
+        s_sd_card = NULL;
         ESP_LOGE(TAG, "SD mount failed: 0x%x (%s)", err, esp_err_to_name(err));
         return false;
     }
-    sdmmc_card_print_info(stdout, card);
+    sdmmc_card_print_info(stdout, s_sd_card);
     return true;
 }
 
+static void sd_unmount(void)
+{
+    if (!s_sd_card) return;
+    esp_err_t err = esp_vfs_fat_sdcard_unmount(MOUNT_POINT, s_sd_card);
+    if (err != ESP_OK) ESP_LOGW(TAG, "SD unmount failed: %s", esp_err_to_name(err));
+    s_sd_card = NULL;
+    s_sd_ok = false;
+}
+
 /* ---------------- Audio (ES7210) ---------------- */
-/* Only the (disabled) speaker preview needs to release the mic mid-session; the
- * recorder keeps it open, so this is gated with the playback path. */
-#if SPEAKER_ENABLED
 static void audio_input_deinit(void)
 {
     if (s_codec) {
@@ -1226,42 +1727,44 @@ static void audio_input_deinit(void)
         i2s_del_channel(s_i2s_rx);
         s_i2s_rx = NULL;
     }
+    s_audio_open = false;
 }
 
-static void audio_output_deinit(void)
+static esp_err_t audio_resume(void)
 {
-    if (s_play_codec) {
-        esp_codec_dev_close(s_play_codec);
-        esp_codec_dev_delete(s_play_codec);
-        s_play_codec = NULL;
-    }
-    if (s_play_codec_if) {
-        audio_codec_delete_codec_if(s_play_codec_if);
-        s_play_codec_if = NULL;
-    }
-    if (s_play_ctrl_if) {
-        audio_codec_delete_ctrl_if(s_play_ctrl_if);
-        s_play_ctrl_if = NULL;
-    }
-    if (s_play_gpio_if) {
-        audio_codec_delete_gpio_if(s_play_gpio_if);
-        s_play_gpio_if = NULL;
-    }
-    if (s_play_data_if) {
-        audio_codec_delete_data_if(s_play_data_if);
-        s_play_data_if = NULL;
-    }
-    if (s_i2s_tx) {
-        i2s_channel_disable(s_i2s_tx);
-        i2s_del_channel(s_i2s_tx);
-        s_i2s_tx = NULL;
-    }
+    if (s_audio_open) return ESP_OK;
+    ESP_RETURN_ON_FALSE(s_codec && s_i2s_rx, ESP_ERR_INVALID_STATE, TAG, "audio not initialized");
+
+    esp_codec_dev_sample_info_t fs = {
+        .bits_per_sample = 16,
+        .channel = CHAN_NUM,
+        .channel_mask = MIC_SELECTED,
+        .sample_rate = SAMPLE_RATE,
+    };
+    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_codec, &fs) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "codec open");
+    ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_codec, MIC_GAIN_DB) == ESP_CODEC_DEV_OK,
+                        ESP_FAIL, TAG, "set gain");
+    s_audio_open = true;
+    vTaskDelay(pdMS_TO_TICKS(35));
+    ESP_LOGI(TAG, "audio capture resumed");
+    return ESP_OK;
 }
-#endif
+
+static void audio_suspend(void)
+{
+    if (!s_audio_open || !s_codec) return;
+    if (esp_codec_dev_close(s_codec) != ESP_CODEC_DEV_OK) {
+        ESP_LOGW(TAG, "audio capture suspend failed");
+        return;
+    }
+    s_audio_open = false;
+    ESP_LOGI(TAG, "audio capture suspended");
+}
 
 static esp_err_t audio_init(void)
 {
-    if (s_codec && s_i2s_rx) return ESP_OK;
+    if (s_codec && s_i2s_rx) return audio_resume();
 
     /* I2S RX channel in TDM mode (es7210 driver defaults to Philips format) */
     i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
@@ -1287,18 +1790,7 @@ static esp_err_t audio_init(void)
     };
     ESP_RETURN_ON_ERROR(i2s_channel_init_tdm_mode(s_i2s_rx, &tdm_cfg), TAG, "i2s tdm");
 
-    if (!s_i2c_bus) {
-        /* Shared I2C master bus for ES7210, ES8311, CST816 touch, and AXP2101. */
-        i2c_master_bus_config_t i2c_cfg = {
-            .i2c_port = I2C_PORT,
-            .sda_io_num = PIN_I2C_SDA,
-            .scl_io_num = PIN_I2C_SCL,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .flags.enable_internal_pullup = true,
-        };
-        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
-    }
+    ESP_RETURN_ON_ERROR(shared_i2c_init(), TAG, "i2c bus");
 
     audio_codec_i2c_cfg_t ctrl_cfg = {
         .port = I2C_PORT,
@@ -1334,110 +1826,25 @@ static esp_err_t audio_init(void)
     s_codec = esp_codec_dev_new(&dev_cfg);
     ESP_RETURN_ON_FALSE(s_codec, ESP_FAIL, TAG, "codec dev new");
 
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = 16,
-        .channel = CHAN_NUM,
-        .channel_mask = MIC_SELECTED,
-        .sample_rate = SAMPLE_RATE,
-    };
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_codec, &fs) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "codec open");
-    ESP_RETURN_ON_FALSE(esp_codec_dev_set_in_gain(s_codec, MIC_GAIN_DB) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "set gain");
-
-    ESP_LOGI(TAG, "ES7210 ready: %d Hz, %d ch, 16-bit, gain %.0f dB",
+    ESP_RETURN_ON_ERROR(audio_resume(), TAG, "audio resume");
+    ESP_LOGI(TAG, "ES7210 initialized: %d Hz, %d ch, 16-bit, gain %.0f dB",
              SAMPLE_RATE, CHAN_NUM, MIC_GAIN_DB);
     return ESP_OK;
 }
 
-#if SPEAKER_ENABLED
-static esp_err_t audio_output_init(uint32_t sample_rate, int channels, int bits_per_sample)
+static esp_err_t audio_init_with_retry(void)
 {
-    if (s_play_codec && s_i2s_tx) return ESP_OK;
-    if (channels != 1 && channels != 2) channels = 2;
-    if (bits_per_sample != 16 && bits_per_sample != 32) bits_per_sample = 16;
-
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_AUTO, I2S_ROLE_MASTER);
-    chan_cfg.dma_desc_num = 8;
-    chan_cfg.dma_frame_num = 512;
-    ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, &s_i2s_tx, NULL), TAG, "i2s tx new");
-
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sample_rate),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(bits_per_sample,
-                                                        channels == 1 ? I2S_SLOT_MODE_MONO : I2S_SLOT_MODE_STEREO),
-        .gpio_cfg = {
-            .mclk = PIN_I2S_MCLK,
-            .bclk = PIN_I2S_BCLK,
-            .ws = PIN_I2S_WS,
-            .dout = PIN_I2S_DOUT,
-            .din = PIN_I2S_DIN,
-        },
-    };
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_i2s_tx, &std_cfg), TAG, "i2s tx std");
-    ESP_RETURN_ON_ERROR(i2s_channel_enable(s_i2s_tx), TAG, "i2s tx enable");
-
-    if (!s_i2c_bus) {
-        i2c_master_bus_config_t i2c_cfg = {
-            .i2c_port = I2C_PORT,
-            .sda_io_num = PIN_I2C_SDA,
-            .scl_io_num = PIN_I2C_SCL,
-            .clk_source = I2C_CLK_SRC_DEFAULT,
-            .glitch_ignore_cnt = 7,
-            .flags.enable_internal_pullup = true,
-        };
-        ESP_RETURN_ON_ERROR(i2c_new_master_bus(&i2c_cfg, &s_i2c_bus), TAG, "i2c bus");
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        err = audio_init();
+        if (err == ESP_OK) return ESP_OK;
+        ESP_LOGW(TAG, "audio init attempt %d failed: %s", attempt, esp_err_to_name(err));
+        audio_input_deinit();
+        axp_init_battery();
+        vTaskDelay(pdMS_TO_TICKS(80 * attempt));
     }
-
-    audio_codec_i2s_cfg_t i2s_data_cfg = {
-        .port = I2S_NUM_0,
-        .rx_handle = NULL,
-        .tx_handle = s_i2s_tx,
-    };
-    s_play_data_if = audio_codec_new_i2s_data(&i2s_data_cfg);
-    ESP_RETURN_ON_FALSE(s_play_data_if, ESP_FAIL, TAG, "es8311 i2s data");
-
-    audio_codec_i2c_cfg_t ctrl_cfg = {
-        .port = I2C_PORT,
-        .addr = ES8311_CODEC_DEFAULT_ADDR,
-        .bus_handle = s_i2c_bus,
-    };
-    s_play_ctrl_if = audio_codec_new_i2c_ctrl(&ctrl_cfg);
-    ESP_RETURN_ON_FALSE(s_play_ctrl_if, ESP_FAIL, TAG, "es8311 i2c ctrl");
-    s_play_gpio_if = audio_codec_new_gpio();
-    ESP_RETURN_ON_FALSE(s_play_gpio_if, ESP_FAIL, TAG, "es8311 gpio");
-
-    es8311_codec_cfg_t es_cfg = {
-        .ctrl_if = s_play_ctrl_if,
-        .gpio_if = s_play_gpio_if,
-        .codec_mode = ESP_CODEC_DEV_WORK_MODE_DAC,
-        .pa_pin = -1,
-        .use_mclk = false,
-    };
-    s_play_codec_if = es8311_codec_new(&es_cfg);
-    ESP_RETURN_ON_FALSE(s_play_codec_if, ESP_FAIL, TAG, "es8311 new");
-
-    esp_codec_dev_cfg_t dev_cfg = {
-        .dev_type = ESP_CODEC_DEV_TYPE_OUT,
-        .codec_if = s_play_codec_if,
-        .data_if = s_play_data_if,
-    };
-    s_play_codec = esp_codec_dev_new(&dev_cfg);
-    ESP_RETURN_ON_FALSE(s_play_codec, ESP_FAIL, TAG, "play codec dev new");
-
-    esp_codec_dev_sample_info_t fs = {
-        .bits_per_sample = bits_per_sample,
-        .channel = channels,
-        .sample_rate = sample_rate,
-    };
-    ESP_RETURN_ON_FALSE(esp_codec_dev_open(s_play_codec, &fs) == ESP_CODEC_DEV_OK,
-                        ESP_FAIL, TAG, "play codec open");
-    esp_codec_dev_set_out_vol(s_play_codec, 75);
-
-    ESP_LOGI(TAG, "ES8311 ready: %" PRIu32 " Hz, %d ch, %d-bit", sample_rate, channels, bits_per_sample);
-    return ESP_OK;
+    return err;
 }
-#endif
 
 static bool parse_clip_index(const char *name, int *index)
 {
@@ -1456,65 +1863,135 @@ static bool parse_clip_index(const char *name, int *index)
     return true;
 }
 
-static int compare_ints(const void *a, const void *b)
+static int scan_clip_bitmap(uint8_t *bitmap)
 {
-    int ia = *(const int *)a;
-    int ib = *(const int *)b;
-    return (ia > ib) - (ia < ib);
-}
-
-static int collect_clip_indices_all(int *indices, int max_indices)
-{
+    memset(bitmap, 0, CLIP_BITMAP_BYTES);
     DIR *d = opendir(CLIPS_DIR);
     if (!d) return 0;
     int count = 0;
     struct dirent *e;
-    while (count < max_indices && (e = readdir(d)) != NULL) {
+    while ((e = readdir(d)) != NULL) {
         int idx = 0;
-        if (parse_clip_index(e->d_name, &idx)) indices[count++] = idx;
+        if (parse_clip_index(e->d_name, &idx)) {
+            bitmap[idx >> 3] |= (uint8_t)(1U << (idx & 7));
+            count++;
+        }
     }
     closedir(d);
-    qsort(indices, count, sizeof(indices[0]), compare_ints);
     return count;
+}
+
+static bool clip_bitmap_has(const uint8_t *bitmap, int index)
+{
+    return (bitmap[index >> 3] & (uint8_t)(1U << (index & 7))) != 0;
 }
 
 /* pick the next unused /sdcard/clips/rec_NNN.wav */
 static int next_index(void)
 {
-    bool used[1000] = {0};
-    int indices[999];
-    int count = collect_clip_indices_all(indices, 999);
-    for (int i = 0; i < count; i++) used[indices[i]] = true;
+    static uint8_t used[CLIP_BITMAP_BYTES];
+    scan_clip_bitmap(used);
     for (int i = 1; i < 1000; i++) {
-        if (!used[i]) return i;
+        if (!clip_bitmap_has(used, i)) return i;
     }
-    return 999;
+    return -1;
 }
 
 static int pending_clip_count(void)
 {
-    int indices[999];
-    return collect_clip_indices_all(indices, 999);
+    static uint8_t used[CLIP_BITMAP_BYTES];
+    return scan_clip_bitmap(used);
 }
 
 static int collect_clip_indices_page(int *indices, int max_indices, int offset)
 {
-    int all[999];
-    int total = collect_clip_indices_all(all, 999);
+    static uint8_t used[CLIP_BITMAP_BYTES];
+    scan_clip_bitmap(used);
     int count = 0;
-    for (int i = offset; i < total && count < max_indices; i++) indices[count++] = all[i];
+    int seen = 0;
+    for (int i = 1; i < 1000 && count < max_indices; i++) {
+        if (!clip_bitmap_has(used, i)) continue;
+        if (seen++ < offset) continue;
+        indices[count++] = i;
+    }
     return count;
+}
+
+static void commit_pending_trash(void)
+{
+    if (!s_trash_pending) return;
+    if (remove(s_trash_path) != 0) ESP_LOGW(TAG, "trash cleanup failed: %s", s_trash_path);
+    s_trash_pending = false;
+    s_trash_path[0] = '\0';
+    s_trash_restore_path[0] = '\0';
+}
+
+static void auto_power_off_if_due(int64_t now_ms)
+{
+    if (s_screen_on || s_recording_active || s_upload_active ||
+        s_screen_sleep_started_ms == 0 ||
+        now_ms - s_screen_sleep_started_ms < AUTO_POWER_OFF_MS ||
+        now_ms < s_next_auto_poweroff_attempt_ms) {
+        return;
+    }
+
+    battery_info_t power = battery_read();
+    if (!power.valid || power.vbus) {
+        s_next_auto_poweroff_attempt_ms = now_ms + AUTO_POWER_RETRY_MS;
+        return;
+    }
+
+    s_next_auto_poweroff_attempt_ms = now_ms + AUTO_POWER_RETRY_MS;
+    commit_pending_trash();
+    audio_suspend();
+    ESP_LOGI(TAG, "10-minute battery standby elapsed; requesting AXP2101 shutdown");
+    if (!axp_shutdown()) {
+        ESP_LOGE(TAG, "automatic AXP2101 shutdown request failed; retrying in 60 seconds");
+        return;
+    }
+
+    /* A successful battery-powered request normally removes VSYS immediately.
+     * If execution continues, stay safely blank and retry later rather than
+     * spinning or exposing a half-powered display. */
+    vTaskDelay(pdMS_TO_TICKS(500));
+    screen_sleep();
+    ESP_LOGW(TAG, "AXP2101 shutdown request returned without removing power");
+}
+
+static uint32_t screen_off_poll_ms(int64_t now_ms)
+{
+    if (s_screen_sleep_started_ms == 0 ||
+        now_ms - s_screen_sleep_started_ms < PKEY_FAST_WINDOW_MS) {
+        return PKEY_FAST_POLL_MS;
+    }
+    return PKEY_SLOW_POLL_MS;
+}
+
+static bool undo_pending_trash(void)
+{
+    if (!s_trash_pending) return false;
+    bool restored = rename(s_trash_path, s_trash_restore_path) == 0;
+    if (!restored) ESP_LOGW(TAG, "trash restore failed: %s", s_trash_path);
+    s_trash_pending = false;
+    s_trash_path[0] = '\0';
+    s_trash_restore_path[0] = '\0';
+    return restored;
 }
 
 static bool delete_clip_index(int index)
 {
-    char path[80];
-    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
-    if (remove(path) == 0) {
-        ESP_LOGI(TAG, "deleted %s", path);
+    commit_pending_trash();
+    snprintf(s_trash_restore_path, sizeof(s_trash_restore_path), CLIPS_DIR "/rec_%03d.wav", index);
+    snprintf(s_trash_path, sizeof(s_trash_path), CLIPS_DIR "/rec_%03d.trash", index);
+    if (rename(s_trash_restore_path, s_trash_path) == 0) {
+        s_trash_pending = true;
+        s_trash_deadline_ms = esp_timer_get_time() / 1000 + 2000;
+        ESP_LOGI(TAG, "soft-deleted %s", s_trash_restore_path);
         return true;
     }
-    ESP_LOGW(TAG, "delete failed: %s", path);
+    ESP_LOGW(TAG, "delete failed: %s", s_trash_restore_path);
+    s_trash_restore_path[0] = '\0';
+    s_trash_path[0] = '\0';
     return false;
 }
 
@@ -1547,6 +2024,116 @@ static void ensure_clips_folder(void)
     if (moved) ESP_LOGI(TAG, "moved %d clip(s) from root into %s", moved, CLIPS_DIR);
 }
 
+static bool wav_checkpoint(FILE *f, uint32_t data_bytes, bool durable)
+{
+    wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(data_bytes, 16, SAMPLE_RATE, CHAN_NUM);
+    if (fseek(f, 0, SEEK_SET) != 0) return false;
+    if (fwrite(&hdr, 1, sizeof(hdr), f) != sizeof(hdr)) return false;
+    if (fflush(f) != 0) return false;
+    if (durable && fsync(fileno(f)) != 0) return false;
+    return fseek(f, 0, SEEK_END) == 0;
+}
+
+static bool recording_space_available(uint32_t required_bytes)
+{
+    uint64_t total_bytes = 0, free_bytes = 0;
+    if (esp_vfs_fat_info(MOUNT_POINT, &total_bytes, &free_bytes) != ESP_OK) {
+        ESP_LOGW(TAG, "could not read SD free space");
+        return true;
+    }
+    return free_bytes >= (uint64_t)required_bytes + RECORDING_RESERVE_BYTES;
+}
+
+static bool parse_partial_index(const char *name, int *index)
+{
+    if (strlen(name) != 12 || strncasecmp(name, "rec_", 4) != 0 ||
+        strcasecmp(name + 7, ".part") != 0) return false;
+    if (name[4] < '0' || name[4] > '9' || name[5] < '0' || name[5] > '9' ||
+        name[6] < '0' || name[6] > '9') return false;
+    *index = (name[4] - '0') * 100 + (name[5] - '0') * 10 + (name[6] - '0');
+    return *index > 0 && *index < 1000;
+}
+
+static void recover_partial_recordings(void)
+{
+    static char names[32][16];
+    DIR *d = opendir(CLIPS_DIR);
+    if (!d) return;
+    int count = 0;
+    struct dirent *e;
+    while (count < 32 && (e = readdir(d)) != NULL) {
+        int index = 0;
+        if (parse_partial_index(e->d_name, &index)) {
+            strlcpy(names[count++], e->d_name, sizeof(names[0]));
+        }
+    }
+    closedir(d);
+
+    for (int i = 0; i < count; i++) {
+        int index = 0;
+        if (!parse_partial_index(names[i], &index)) continue;
+        char partial[96], final[96];
+        snprintf(partial, sizeof(partial), CLIPS_DIR "/%s", names[i]);
+        snprintf(final, sizeof(final), CLIPS_DIR "/rec_%03d.wav", index);
+        FILE *f = fopen(partial, "rb+");
+        if (!f) continue;
+        bool ok = fseek(f, 0, SEEK_END) == 0;
+        long size = ok ? ftell(f) : -1;
+        uint32_t data_bytes = size > (long)sizeof(wav_header_t)
+                            ? (uint32_t)(size - sizeof(wav_header_t)) : 0;
+        ok = data_bytes > 0 && wav_checkpoint(f, data_bytes, true);
+        fclose(f);
+        if (ok && rename(partial, final) == 0) {
+            ESP_LOGW(TAG, "recovered interrupted recording %s", final);
+        } else if (data_bytes == 0) {
+            remove(partial);
+        } else {
+            ESP_LOGE(TAG, "could not recover %s; retaining partial file", partial);
+        }
+    }
+}
+
+static bool device_ready(void)
+{
+    return s_sd_ok && s_audio_ok && s_touch_ok;
+}
+
+static void monitor_sd_health(int64_t now_ms)
+{
+    if (!s_sd_ok || now_ms < s_next_sd_health_ms || s_recording_active || s_upload_active) return;
+    s_next_sd_health_ms = now_ms + 5000;
+    struct stat st = {0};
+    if (stat(CLIPS_DIR, &st) != 0) {
+        ESP_LOGW(TAG, "SD card became unavailable");
+        sd_unmount();
+        if (s_screen_on) ui_show_error("NO SD");
+    }
+}
+
+static void retry_unavailable_peripherals(int64_t now_ms)
+{
+    if (device_ready() || now_ms < s_next_peripheral_retry_ms ||
+        s_recording_active || s_upload_active) return;
+    s_next_peripheral_retry_ms = now_ms + 5000;
+
+    if (!s_sd_ok) {
+        s_sd_ok = sd_mount();
+        if (s_sd_ok) {
+            ensure_clips_folder();
+            recover_partial_recordings();
+        }
+    }
+    if (!s_audio_ok) {
+        s_audio_ok = audio_init_with_retry() == ESP_OK;
+        if (s_audio_ok) audio_suspend();
+    }
+    if (!s_touch_ok) {
+        touch_deinit();
+        s_touch_ok = touch_init() == ESP_OK;
+    }
+    if (device_ready() && s_screen_on) ui_show_home();
+}
+
 static uint8_t audio_level_from_pcm(const uint8_t *buf, size_t bytes)
 {
     const int16_t *samples = (const int16_t *)buf;
@@ -1570,20 +2157,54 @@ static uint8_t audio_level_from_pcm(const uint8_t *buf, size_t bytes)
 }
 
 /* Record audio to a WAV until stop is requested or the safety cap is reached. */
-static void record_wav(int index)
+static bool record_wav(int index)
 {
-    char path[80];
-    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
+    if (index < 1) {
+        ui_show_error("STORAGE FULL");
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        return false;
+    }
 
     const uint32_t byte_rate = SAMPLE_RATE * CHAN_NUM * 16 / 8;
-    const uint32_t max_wav_size  = byte_rate * MAX_RECORD_SECONDS;
-    wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(max_wav_size, 16, SAMPLE_RATE, CHAN_NUM);
+    const uint32_t max_wav_size = byte_rate * MAX_RECORD_SECONDS;
+    if (!recording_space_available(max_wav_size + sizeof(wav_header_t))) {
+        ui_show_error("NO SPACE");
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        return false;
+    }
 
-    FILE *f = fopen(path, "w");
-    if (!f) { ESP_LOGE(TAG, "open %s failed", path); return; }
-    fwrite(&hdr, sizeof(hdr), 1, f);
+    if (audio_resume() != ESP_OK) {
+        ESP_LOGE(TAG, "recording aborted: audio resume failed");
+        ui_show_error("NO AUDIO");
+        vTaskDelay(pdMS_TO_TICKS(900));
+        return false;
+    }
 
-    ESP_LOGI(TAG, "Recording max %ds -> %s", MAX_RECORD_SECONDS, path);
+    char path[80], partial_path[80];
+    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
+    snprintf(partial_path, sizeof(partial_path), CLIPS_DIR "/rec_%03d.part", index);
+    wav_header_t hdr = WAV_HEADER_PCM_DEFAULT(0, 16, SAMPLE_RATE, CHAN_NUM);
+
+    FILE *f = fopen(partial_path, "wb+");
+    if (!f) {
+        ESP_LOGE(TAG, "open %s failed", partial_path);
+        audio_suspend();
+        sd_unmount();
+        ui_show_error("SD ERROR");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        return false;
+    }
+    if (fwrite(&hdr, 1, sizeof(hdr), f) != sizeof(hdr)) {
+        ESP_LOGE(TAG, "WAV header write failed");
+        fclose(f);
+        audio_suspend();
+        sd_unmount();
+        ui_show_error("SD ERROR");
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Recording max %ds -> %s", MAX_RECORD_SECONDS, partial_path);
     s_active_clip_index = index;
     s_recording_active = true;
     ui_show_recording(0);
@@ -1599,13 +2220,20 @@ static void record_wav(int index)
     int64_t last_level_ms = 0;
     int64_t start_tick = esp_timer_get_time() / 1000;
     uint32_t elapsed_ms = 0;
+    uint32_t checkpoint_bytes = 0;
+    bool write_ok = true;
     while (written < max_wav_size) {
         size_t to_read = sizeof(buf);
         if (max_wav_size - written < to_read) to_read = max_wav_size - written;
         size_t got = 0;
         esp_err_t r = i2s_channel_read(s_i2s_rx, buf, to_read, &got, pdMS_TO_TICKS(1000));
         if (r != ESP_OK) { ESP_LOGE(TAG, "i2s read: %s", esp_err_to_name(r)); break; }
-        fwrite(buf, got, 1, f);
+        if (got == 0) continue;
+        if (fwrite(buf, 1, got, f) != got) {
+            ESP_LOGE(TAG, "SD write failed after %" PRIu32 " bytes", written);
+            write_ok = false;
+            break;
+        }
         written += got;
 
         elapsed_ms = (uint32_t)((esp_timer_get_time() / 1000) - start_tick);
@@ -1622,18 +2250,38 @@ static void record_wav(int index)
             last_level_ms = elapsed_ms;
         }
 
+        if (written - checkpoint_bytes >= byte_rate) {
+            if (!wav_checkpoint(f, written, false)) {
+                ESP_LOGE(TAG, "WAV checkpoint failed");
+                write_ok = false;
+                break;
+            }
+            checkpoint_bytes = written;
+        }
+
         if (elapsed_ms > MIN_RECORD_MS && touch_record_pressed()) {
             ESP_LOGI(TAG, "Stop requested at %" PRIu32 "ms", elapsed_ms);
             break;
         }
     }
-    hdr = (wav_header_t)WAV_HEADER_PCM_DEFAULT(written, 16, SAMPLE_RATE, CHAN_NUM);
-    fseek(f, 0, SEEK_SET);
-    fwrite(&hdr, sizeof(hdr), 1, f);
-    fclose(f);
     s_recording_active = false;
+    audio_suspend();
+    ui_show_saving(elapsed_ms);
+    write_ok = write_ok && written > 0 && wav_checkpoint(f, written, true);
+    if (fclose(f) != 0) write_ok = false;
+    if (write_ok && rename(partial_path, path) != 0) write_ok = false;
+    if (!write_ok) {
+        ESP_LOGE(TAG, "recording finalization failed; retained %s for recovery", partial_path);
+        sd_unmount();
+        ui_show_error("SD ERROR");
+        vTaskDelay(pdMS_TO_TICKS(1200));
+        ui_show_home_after_recording();
+        return false;
+    }
     ESP_LOGI(TAG, "Saved %s (%" PRIu32 " bytes)", path, written);
     ui_show_saved(elapsed_ms);
+    ui_show_home_after_recording();
+    return true;
 }
 
 /* ---------------- WiFi upload (creds + server URL from /sdcard/wifi.txt) ---------------- */
@@ -1712,19 +2360,26 @@ static esp_err_t wifi_up(const wifi_conf_t *c)
     if (!s_netstack_ready) {
         esp_err_t e = nvs_flash_init();
         if (e == ESP_ERR_NVS_NO_FREE_PAGES || e == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-            ESP_ERROR_CHECK(nvs_flash_erase());
-            ESP_ERROR_CHECK(nvs_flash_init());
+            e = nvs_flash_erase();
+            if (e == ESP_OK) e = nvs_flash_init();
         }
-        ESP_ERROR_CHECK(esp_netif_init());
-        ESP_ERROR_CHECK(esp_event_loop_create_default());
-        esp_netif_create_default_wifi_sta();
+        if (e != ESP_OK) return e;
+        e = esp_netif_init();
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return e;
+        e = esp_event_loop_create_default();
+        if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return e;
+        if (!esp_netif_create_default_wifi_sta()) return ESP_ERR_NO_MEM;
         wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        e = esp_wifi_init(&cfg);
+        if (e != ESP_OK) return e;
         s_wifi_evt = xEventGroupCreate();
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
-                                                            wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
-                                                            wifi_event_handler, NULL, NULL));
+        if (!s_wifi_evt) return ESP_ERR_NO_MEM;
+        e = esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID,
+                                                wifi_event_handler, NULL, NULL);
+        if (e != ESP_OK) return e;
+        e = esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP,
+                                                wifi_event_handler, NULL, NULL);
+        if (e != ESP_OK) return e;
         s_netstack_ready = true;
     }
 
@@ -1732,16 +2387,30 @@ static esp_err_t wifi_up(const wifi_conf_t *c)
     strlcpy((char *)wc.sta.ssid, c->ssid, sizeof(wc.sta.ssid));
     strlcpy((char *)wc.sta.password, c->password, sizeof(wc.sta.password));
     wc.sta.threshold.authmode = c->password[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) return err;
+    err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (err != ESP_OK) return err;
 
     s_wifi_retry = 0;
     xEventGroupClearBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
-    ESP_ERROR_CHECK(esp_wifi_start());
+    err = esp_wifi_start();
+    if (err != ESP_OK) return err;
 
-    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
-                                           pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
-    if (bits & WIFI_CONNECTED_BIT) return ESP_OK;
+    EventBits_t bits = 0;
+    int stage = 0;
+    for (int waited_ms = 0; waited_ms < 20000; waited_ms += 250) {
+        bits = xEventGroupWaitBits(s_wifi_evt, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
+                                   pdFALSE, pdFALSE, pdMS_TO_TICKS(250));
+        if (bits & WIFI_CONNECTED_BIT) return ESP_OK;
+        if (bits & WIFI_FAIL_BIT) break;
+        if ((waited_ms % 500) == 0) {
+            stage = stage % 3 + 1;
+            ui_set_state(UI_STATE_CONNECTING);
+            draw_wifi_icon_stage(stage);
+            keep_screen_awake();
+        }
+    }
     ESP_LOGE(TAG, "WiFi connect failed/timeout for ssid=%s", c->ssid);
     esp_wifi_stop();
     return ESP_FAIL;
@@ -1756,6 +2425,7 @@ static void wifi_down(void)
 
 #define UP_BOUNDARY "----wordclipBoundary7MA4YWxkTrZu0gW"
 #define MIN_UPLOAD_WAV_BYTES 45
+#define HTTP_UPLOAD_INVALID -2
 
 static bool wav_file_has_audio(const char *path, long *size_out)
 {
@@ -1817,7 +2487,20 @@ static void sync_time_from_response(const char *body)
 
     struct timeval tv = {.tv_sec = epoch, .tv_usec = 0};
     settimeofday(&tv, NULL);
+    if (!rtc_set_utc(epoch)) ESP_LOGW(TAG, "could not persist time to PCF85063");
     ESP_LOGI(TAG, "RTC synced from Hoth: %04d-%02d-%02dT%02d:%02d:%02d", year, mon, day, hour, min, sec);
+}
+
+static bool http_write_all(esp_http_client_handle_t client, const void *data, size_t length)
+{
+    const char *bytes = (const char *)data;
+    size_t offset = 0;
+    while (offset < length) {
+        int written = esp_http_client_write(client, bytes + offset, length - offset);
+        if (written <= 0) return false;
+        offset += (size_t)written;
+    }
+    return true;
 }
 
 /* POST one WAV to <server>/api/upload as multipart/form-data (field "file").
@@ -1827,14 +2510,14 @@ static int http_upload_file(const char *server, const char *fullpath, const char
     long checked_size = 0;
     if (!wav_file_has_audio(fullpath, &checked_size)) {
         ESP_LOGW(TAG, "skipping invalid/empty WAV %s (%ld bytes)", filename, checked_size);
-        return 0;  /* Local junk cleanup; no server request was made. */
+        return HTTP_UPLOAD_INVALID;
     }
 
     FILE *f = fopen(fullpath, "rb");
     if (!f) { ESP_LOGE(TAG, "open %s failed", fullpath); return -1; }
-    fseek(f, 0, SEEK_END);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
     long fsize = ftell(f);
-    fseek(f, 0, SEEK_SET);
+    if (fsize < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return -1; }
 
     char capture_part[192] = "";
     char captured_at[32] = "";
@@ -1864,6 +2547,11 @@ static int http_upload_file(const char *server, const char *fullpath, const char
         .timeout_ms = 20000,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (!client) {
+        fclose(f);
+        ESP_LOGE(TAG, "http client allocation failed");
+        return -1;
+    }
     esp_http_client_set_header(client, "Content-Type",
                                "multipart/form-data; boundary=" UP_BOUNDARY);
 
@@ -1872,14 +2560,15 @@ static int http_upload_file(const char *server, const char *fullpath, const char
         ESP_LOGE(TAG, "http open failed for %s", url);
         goto done;
     }
-    if (esp_http_client_write(client, preamble, plen) < 0) goto done;
+    if (!http_write_all(client, preamble, plen)) goto done;
 
     static uint8_t up_buf[2048];
     size_t n;
     while ((n = fread(up_buf, 1, sizeof(up_buf), f)) > 0) {
-        if (esp_http_client_write(client, (char *)up_buf, n) < 0) { ESP_LOGE(TAG, "body write failed"); goto done; }
+        if (!http_write_all(client, up_buf, n)) { ESP_LOGE(TAG, "body write failed"); goto done; }
     }
-    if (esp_http_client_write(client, epilogue, elen) < 0) goto done;
+    if (ferror(f)) { ESP_LOGE(TAG, "SD read failed during upload"); goto done; }
+    if (!http_write_all(client, epilogue, elen)) goto done;
 
     esp_http_client_fetch_headers(client);
     status = esp_http_client_get_status_code(client);
@@ -1927,34 +2616,29 @@ static void upload_pending_clips(void)
         return;
     }
 
-    /* Count clips to sync so we can show progress. */
-    int total = 0;
-    for (int i = 1; i < 1000; i++) {
-        char path[80];
-        snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
-        FILE *p = fopen(path, "r");
-        if (p) { fclose(p); total++; }
-    }
+    /* Scan once so sparse numbering does not require 999 fopen calls twice. */
+    static uint8_t pending[CLIP_BITMAP_BYTES];
+    int total = scan_clip_bitmap(pending);
     ESP_LOGI(TAG, "Syncing %d clip(s) to %s", total, conf.server);
     upload_progress(0, total);
 
     /* Stage 3: upload every clip; delete each from the card only on a 2xx ACK. */
-    int uploaded = 0, skipped = 0, failed = 0, processed = 0;
+    int uploaded = 0, invalid = 0, failed = 0, processed = 0;
     for (int i = 1; i < 1000 && processed < total; i++) {
+        if (!clip_bitmap_has(pending, i)) continue;
         char path[80], name[24];
         snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", i);
         snprintf(name, sizeof(name), "rec_%03d.wav", i);
-        FILE *probe = fopen(path, "r");
-        if (!probe) continue;
-        fclose(probe);
-
         int status = http_upload_file(conf.server, path, name);
-        if (status == 0) {
-            remove(path);
-            skipped++;
+        if (status == HTTP_UPLOAD_INVALID) {
+            invalid++;
+            ESP_LOGW(TAG, "retaining invalid snap for user review: %s", name);
         } else if (status >= 200 && status < 300) {
-            remove(path);
-            uploaded++;
+            if (remove(path) == 0) uploaded++;
+            else {
+                failed++;
+                ESP_LOGE(TAG, "server accepted %s but local delete failed", name);
+            }
         } else {
             failed++;
             ESP_LOGE(TAG, "upload %s failed (HTTP %d), keeping on card", name, status);
@@ -1964,89 +2648,11 @@ static void upload_pending_clips(void)
     }
 
     wifi_down();
-    if (failed == 0) ui_show_uploading(100);
-    else ui_show_error("NO SERVER");
-    vTaskDelay(pdMS_TO_TICKS(1200));
+    ui_show_upload_result(uploaded, failed + invalid);
+    vTaskDelay(pdMS_TO_TICKS(1500));
     upload_busy_end();
-    ESP_LOGI(TAG, "Sync finished: %d uploaded, %d skipped, %d failed", uploaded, skipped, failed);
+    ESP_LOGI(TAG, "Sync finished: %d uploaded, %d invalid, %d failed", uploaded, invalid, failed);
 }
-
-#if SPEAKER_ENABLED
-static void preview_clip_index(int index)
-{
-    char path[80];
-    snprintf(path, sizeof(path), CLIPS_DIR "/rec_%03d.wav", index);
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        ESP_LOGW(TAG, "preview open failed: %s", path);
-        ui_show_error("NO SNAP");
-        vTaskDelay(pdMS_TO_TICKS(900));
-        return;
-    }
-
-    wav_header_t hdr;
-    if (fread(&hdr, 1, sizeof(hdr), f) != sizeof(hdr) ||
-        memcmp(hdr.descriptor_chunk.chunk_id, "RIFF", 4) != 0 ||
-        memcmp(hdr.descriptor_chunk.chunk_format, "WAVE", 4) != 0 ||
-        memcmp(hdr.data_chunk.subchunk_id, "data", 4) != 0 ||
-        hdr.fmt_chunk.audio_format != 1 ||
-        (hdr.fmt_chunk.bits_per_sample != 16 && hdr.fmt_chunk.bits_per_sample != 32)) {
-        fclose(f);
-        ESP_LOGW(TAG, "preview unsupported WAV: %s", path);
-        ui_show_error("NO SNAP");
-        vTaskDelay(pdMS_TO_TICKS(900));
-        return;
-    }
-
-    uint32_t sample_rate = hdr.fmt_chunk.sample_rate ? hdr.fmt_chunk.sample_rate : SAMPLE_RATE;
-    int channels = hdr.fmt_chunk.num_of_channels ? hdr.fmt_chunk.num_of_channels : CHAN_NUM;
-    int bits = hdr.fmt_chunk.bits_per_sample;
-
-    ui_show_playback(index, 0);
-    audio_input_deinit();
-    if (audio_output_init(sample_rate, channels, bits) != ESP_OK) {
-        fclose(f);
-        audio_output_deinit();
-        ESP_LOGE(TAG, "preview audio output init failed");
-        ui_show_error("NO AUDIO");
-        vTaskDelay(pdMS_TO_TICKS(900));
-        audio_init();
-        return;
-    }
-
-    uint8_t buf[2048];
-    uint32_t remaining = hdr.data_chunk.subchunk_size;
-    uint32_t played = 0;
-    int64_t last_bar_ms = 0;
-    uint32_t frame = 0;
-
-    while (remaining > 0) {
-        size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
-        size_t got = fread(buf, 1, want, f);
-        if (got == 0) break;
-        if (esp_codec_dev_write(s_play_codec, buf, (int)got) != ESP_CODEC_DEV_OK) {
-            ESP_LOGW(TAG, "preview write failed");
-            break;
-        }
-        played += got;
-        remaining -= got;
-
-        uint32_t elapsed_ms = (hdr.fmt_chunk.byte_rate > 0) ? (played * 1000U / hdr.fmt_chunk.byte_rate) : 0;
-        ui_recording_update_time(elapsed_ms);
-        int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_bar_ms >= 70) {
-            ui_playback_update_levels(frame++);
-            last_bar_ms = now_ms;
-        }
-    }
-
-    fclose(f);
-    audio_output_deinit();
-    audio_init();
-    draw_status(235, C_GREEN, "DONE");
-    vTaskDelay(pdMS_TO_TICKS(350));
-}
-#endif
 
 static void clip_menu_loop(void)
 {
@@ -2062,11 +2668,20 @@ static void clip_menu_loop(void)
             s_last_activity_ms = esp_timer_get_time() / 1000;
             if (hit_rect(x, y, 20, 16, 220, 68)) {
                 draw_upload_pill_pressed(pending_clip_count());
+                commit_pending_trash();
                 if (pending_clip_count() > 0) upload_pending_clips();
                 return;
             }
             if (hit_rect(x, y, 76, 246, 164, 284)) {
-                draw_pill_pressed(250, "BACK");
+                if (s_trash_pending) {
+                    draw_back_button(true);
+                    undo_pending_trash();
+                    total = pending_clip_count();
+                    visible = collect_clip_indices_page(indices, 3, offset);
+                    ui_show_clip_menu(indices, visible, total, offset);
+                    continue;
+                }
+                draw_back_button(true);
                 return;
             }
             if (hit_rect(x, y, 20, 246, 70, 284)) {
@@ -2088,17 +2703,6 @@ static void clip_menu_loop(void)
 
             for (int i = 0; i < visible; i++) {
                 int row_y = 70 + i * 64;
-#if SPEAKER_ENABLED
-                if (hit_rect(x, y, 0, row_y, 70, row_y + 58)) {
-                    draw_icon_press_flash(33, row_y + 29, false);
-                    preview_clip_index(indices[i]);
-                    total = pending_clip_count();
-                    if (offset >= total && offset > 0) offset = total - 1;
-                    visible = collect_clip_indices_page(indices, 3, offset);
-                    ui_show_clip_menu(indices, visible, total, offset);
-                    break;
-                }
-#endif
                 if (hit_rect(x, y, 176, row_y, 240, row_y + 58)) {
                     draw_icon_press_flash(210, row_y + 29, true);
                     delete_clip_index(indices[i]);
@@ -2112,7 +2716,17 @@ static void clip_menu_loop(void)
         }
 
         int64_t now_ms = esp_timer_get_time() / 1000;
+        handle_pkey_events(now_ms);
+        if (!s_screen_on) {
+            commit_pending_trash();
+            return;
+        }
+        if (s_trash_pending && now_ms >= s_trash_deadline_ms) {
+            commit_pending_trash();
+            ui_show_clip_menu(indices, visible, total, offset);
+        }
         if (s_screen_on && !s_upload_active && (now_ms - s_last_activity_ms > SCREEN_IDLE_MS)) {
+            commit_pending_trash();
             screen_sleep();
             return;
         }
@@ -2122,6 +2736,25 @@ static void clip_menu_loop(void)
 
 void app_main(void)
 {
+    ESP_LOGI(TAG, "boot reset reason=%d", esp_reset_reason());
+    /* Restore PMIC-controlled rails before touching LCD, SD, audio, or touch.
+     * A fully depleted battery can reset these registers to unsafe defaults. */
+    esp_err_t i2c_err = shared_i2c_init();
+    if (i2c_err == ESP_OK) {
+        axp_init_battery();
+        axp_enable_pkey_events();
+        rtc_restore_system_time();
+        battery_info_t initial_battery = battery_read();
+        if (initial_battery.valid) {
+            s_last_known_vbus = initial_battery.vbus;
+            ESP_LOGI(TAG, "boot power: battery=%d%% voltage=%dmV vbus=%d charging=%d done=%d",
+                     initial_battery.percent, initial_battery.millivolts, initial_battery.vbus,
+                     initial_battery.charging, initial_battery.charge_done);
+        }
+    } else {
+        ESP_LOGE(TAG, "shared I2C init failed: %s", esp_err_to_name(i2c_err));
+    }
+
     spi_bus_config_t buscfg = {
         .sclk_io_num = PIN_SCLK,
         .mosi_io_num = PIN_MOSI,
@@ -2133,35 +2766,34 @@ void app_main(void)
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &buscfg, SPI_DMA_CH_AUTO));
 
     ESP_ERROR_CHECK(lcd_init());
-    lcd_fill(C_CHARCOAL);
+    ui_show_power_message("STARTING", C_GREEN);
+    gpio_set_level(PIN_LCD_BL, 1);
     vTaskDelay(pdMS_TO_TICKS(300));
 
     s_sd_ok = sd_mount();
-    if (s_sd_ok) ensure_clips_folder();
+    if (s_sd_ok) {
+        ensure_clips_folder();
+        recover_partial_recordings();
+    }
 
-    esp_err_t aerr = audio_init();
+    esp_err_t aerr = audio_init_with_retry();
     if (aerr != ESP_OK) {
         ESP_LOGE(TAG, "audio_init failed: %s -- check ES7210 / AXP rails", esp_err_to_name(aerr));
     }
+    s_audio_ok = aerr == ESP_OK;
     esp_err_t terr = touch_init();
     if (terr != ESP_OK) {
-        ESP_LOGE(TAG, "touch_init failed: %s -- BOOT can still wake/sleep, but recording requires touch", esp_err_to_name(terr));
+        ESP_LOGE(TAG, "touch_init failed: %s -- onscreen controls unavailable", esp_err_to_name(terr));
     }
-    bool ready = s_sd_ok && (aerr == ESP_OK);
+    s_touch_ok = terr == ESP_OK;
+    if (s_audio_ok) audio_suspend();
 
-    if (ready) ui_show_home();
-    else lcd_fill(C_MAGENTA);
-    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d touch=%d). Tap onscreen record to start/stop; BOOT wakes/sleeps.",
-             ready, s_sd_ok, aerr == ESP_OK, terr == ESP_OK);
-
-    gpio_config_t btn = {
-        .pin_bit_mask = 1ULL << PIN_BTN,
-        .mode = GPIO_MODE_INPUT,
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-    };
-    ESP_ERROR_CHECK(gpio_config(&btn));
-    gpio_wakeup_enable(PIN_BTN, GPIO_INTR_LOW_LEVEL);
-    esp_sleep_enable_gpio_wakeup();
+    if (device_ready()) ui_show_home();
+    else if (!s_sd_ok) ui_show_error("NO SD");
+    else if (!s_touch_ok) ui_show_error("NO TOUCH");
+    else ui_show_error("NO AUDIO");
+    ESP_LOGI(TAG, "Ready=%d (sd=%d audio=%d touch=%d). PWR short toggles screen; hold PWR for shutdown; BOOT is debug-only.",
+             device_ready(), s_sd_ok, s_audio_ok, s_touch_ok);
 
     esp_pm_config_t pm_config = {
         .max_freq_mhz = 160,
@@ -2177,46 +2809,34 @@ void app_main(void)
         if (lock_err != ESP_OK) {
             ESP_LOGW(TAG, "upload PM lock create failed: %s", esp_err_to_name(lock_err));
         }
+        lock_err = esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "usb", &s_usb_pm_lock);
+        if (lock_err != ESP_OK) {
+            ESP_LOGW(TAG, "USB PM lock create failed: %s", esp_err_to_name(lock_err));
+        } else {
+            usb_pm_poll(0, true);
+        }
     }
 
-    int prev = 1, hb = 0;
     s_last_activity_ms = esp_timer_get_time() / 1000;
     while (1) {
-        if (++hb >= 50) {
-            hb = 0;
-            ESP_LOGI(TAG, "hb: sd=%d audio=%d btn=%d scr=%d", s_sd_ok, aerr == ESP_OK,
-                     gpio_get_level(PIN_BTN), s_screen_on);
-        }
         int64_t now_ms = esp_timer_get_time() / 1000;
-        int level = gpio_get_level(PIN_BTN);
 
-        /* Screen asleep: block in light sleep; BOOT press wakes only, it does not act. */
+        usb_pm_poll(now_ms, false);
+        handle_pkey_events(now_ms);
         if (!s_screen_on) {
-            ESP_LOGI(TAG, "enter light sleep; BOOT wakes screen");
-            esp_err_t sleep_err = esp_light_sleep_start();
-            if (sleep_err != ESP_OK) {
-                ESP_LOGW(TAG, "light sleep returned: %s", esp_err_to_name(sleep_err));
-                vTaskDelay(pdMS_TO_TICKS(50));
-            }
-            if (gpio_get_level(PIN_BTN) == 0) {
-                wait_for_button_release();
-                screen_wake();
-            }
-            prev = gpio_get_level(PIN_BTN);
+            /* AXP PWR events are latched. Poll quickly for the first minute,
+             * then once per second until true PMIC shutdown at ten minutes. */
+            auto_power_off_if_due(now_ms);
+            vTaskDelay(pdMS_TO_TICKS(screen_off_poll_ms(now_ms)));
             continue;
         }
 
-        ui_home_poll_charge_indicator(now_ms);
+        monitor_sd_health(now_ms);
+        retry_unavailable_peripherals(now_ms);
+        if (s_ui_state == UI_STATE_HOME) ui_home_poll_charge_indicator(now_ms);
 
-        if (prev == 1 && level == 0) {
-            s_last_activity_ms = now_ms;
-            wait_for_button_release();
-            screen_sleep();
-            prev = gpio_get_level(PIN_BTN);
-            continue;
-        }
-
-        touch_action_t touch_action = touch_home_action();
+        touch_action_t touch_action = s_ui_state == UI_STATE_HOME
+                                    ? touch_home_action() : TOUCH_ACTION_NONE;
         if (touch_action != TOUCH_ACTION_NONE) {
             s_last_activity_ms = now_ms;
         }
@@ -2228,13 +2848,16 @@ void app_main(void)
         }
         if (touch_action == TOUCH_ACTION_RECORD) {
             vTaskDelay(pdMS_TO_TICKS(30));
-            if (ready) {
-                record_wav(next_index());
+            if (device_ready()) {
+                if (!record_wav(next_index()) && s_ui_state != UI_STATE_HOME) ui_show_home();
+            } else if (!s_sd_ok) {
+                ui_show_error("NO SD");
+            } else if (!s_touch_ok) {
+                ui_show_error("NO TOUCH");
             } else {
                 ESP_LOGW(TAG, "not ready, ignoring onscreen record tap");
+                ui_show_error("NO AUDIO");
             }
-            if (ready) ui_show_home();
-            else lcd_fill(C_MAGENTA);
             s_last_activity_ms = esp_timer_get_time() / 1000;
         }
 
@@ -2244,7 +2867,6 @@ void app_main(void)
             screen_sleep();
         }
 
-        prev = level;
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 }

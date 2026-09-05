@@ -203,6 +203,21 @@ def add_note_to_anki(note: dict[str, Any]) -> int:
     return int(result)
 
 
+def update_note_in_anki(note_id: int | str, note: dict[str, Any]) -> None:
+    anki_action(
+        "updateNoteFields",
+        {
+            "note": {
+                "id": int(note_id),
+                "fields": {
+                    "Front": note["front"],
+                    "Back": note["back"],
+                },
+            }
+        },
+    )
+
+
 def sync_anki() -> tuple[bool, str | None]:
     try:
         anki_action("sync", timeout=30)
@@ -442,7 +457,12 @@ def _persist_to_anki(clip_id: str) -> dict[str, Any]:
     if not os.getenv("ANKI_CONNECT_URL", "").strip():
         return update_clip(clip_id, {"status": "approved", "anki_save_mode": "csv"})
 
-    note_id = add_note_to_anki(note)
+    existing_note_id = clip.get("anki_note_id")
+    if existing_note_id:
+        update_note_in_anki(existing_note_id, note)
+        note_id = int(existing_note_id)
+    else:
+        note_id = add_note_to_anki(note)
     synced, sync_error = sync_anki()
     updates = {
         "status": "exported",

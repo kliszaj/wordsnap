@@ -77,7 +77,7 @@ This is a personal tool built to a specific workflow. Generalisability is a non-
 - ESP32-C6, single RISC-V core @ 160MHz
 - 512KB HP SRAM, 16KB LP SRAM, 320KB ROM, **16MB external Flash**
 - **No PSRAM** — this shapes the whole storage design
-- Onboard audio codec + microphone + speaker
+- Onboard audio codec + microphone
 - 1.83" capacitive touch LCD, 240×284
 - 6-axis IMU, RTC (PCF85063), LiPo charging
 - WiFi 6 + BLE 5
