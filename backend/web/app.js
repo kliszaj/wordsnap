@@ -324,7 +324,7 @@ function renderSettings(data) {
   renderSecretStatus(statusOpenai, data.secrets.openai);
   inputLlmProvider.value = data.llm_provider || "anthropic";
   inputClaudeModel.placeholder = data.models.claude.value;
-  inputWhisperModel.placeholder = data.models.whisper.value;
+  inputWhisperModel.value = data.models.whisper.value;
   inputGptModel.placeholder = data.models.gpt.value;
   inputAnkiConnectUrl.placeholder = data.anki.connect_url || "http://10.0.0.x:8765";
   inputAnkiDeck.placeholder = data.anki.deck || "Default";
@@ -341,7 +341,6 @@ function clearSettingsInputs() {
     inputAnthropic,
     inputOpenai,
     inputClaudeModel,
-    inputWhisperModel,
     inputGptModel,
     inputAnkiConnectUrl,
     inputAnkiDeck,

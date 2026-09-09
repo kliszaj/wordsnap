@@ -77,10 +77,13 @@
             <input type="text" id="input-gpt-model" autocomplete="off" spellcheck="false" />
           </label>
           <label class="settings-field">
-            <span class="settings-label">Whisper transcription model</span>
-            <input type="text" id="input-whisper-model" autocomplete="off" spellcheck="false" />
+            <span class="settings-label">Transcription model</span>
+            <select id="input-whisper-model">
+              <option value="whisper-1">Whisper (whisper-1)</option>
+              <option value="gpt-transcribe">GPT Transcribe (gpt-transcribe)</option>
+            </select>
           </label>
-          <p class="settings-help">Whisper is an OpenAI model and always handles audio-to-text before the preferred card model runs.</p>
+          <p class="settings-help">GPT Transcribe offers higher accuracy for completed audio clips. Whisper remains available for compatibility.</p>
         </fieldset>
 
         <fieldset class="settings-group">
@@ -177,6 +180,6 @@
       </article>
     </template>
 
-    <script src="/assets/app.js?v=20260710-4"></script>
+    <script src="/assets/app.js?v=20260909-1"></script>
   </body>
 </html>

@@ -1,7 +1,7 @@
 """Process one Wordclip WAV with the selected Phase 0 pipeline.
 
 Pipeline:
-    WAV -> Whisper transcription -> Claude enrichment -> printable card record
+    WAV -> OpenAI transcription -> Claude enrichment -> printable card record
 """
 from __future__ import annotations
 
@@ -29,7 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("wav", type=Path, help="Path to a Swedish word/phrase WAV clip")
     parser.add_argument(
         "--transcript",
-        help="Use an existing transcript and skip Whisper transcription.",
+        help="Use an existing transcript and skip audio transcription.",
     )
     parser.add_argument(
         "--capture-timestamp",

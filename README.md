@@ -4,7 +4,7 @@ WordSnap is a handheld Swedish vocabulary capture pipeline:
 
 1. ESP32-C6 device records short WAV snips.
 2. Hoth/Unraid receiver accepts uploads.
-3. OpenAI Whisper transcribes Swedish audio.
+3. OpenAI transcribes Swedish audio with Whisper or GPT Transcribe.
 4. Claude enriches the target word.
 5. The web UI lets you correct, reprocess, and save cards directly to Anki.
 
@@ -20,6 +20,10 @@ CLAUDE_MODEL=claude-sonnet-5
 ANKI_CONNECT_URL=http://anki:8765
 ANKI_DECK=Swedish::WordSnap
 ```
+
+`WHISPER_MODEL` accepts `whisper-1` (the compatibility default) or
+`gpt-transcribe` (higher-accuracy transcription for completed audio clips). You
+can also choose either model from the web Settings dialog.
 
 Install and run:
 

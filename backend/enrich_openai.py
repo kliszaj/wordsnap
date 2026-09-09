@@ -1,4 +1,4 @@
-"""OpenAI side — Whisper transcription + GPT enrichment (openai SDK only)."""
+"""OpenAI transcription and GPT enrichment (openai SDK only)."""
 from openai import OpenAI
 
 from schema import Card

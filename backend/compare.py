@@ -3,7 +3,7 @@
 Usage:
     python compare.py path/to/rec_003.wav
 
-The script transcribes Swedish speech with Whisper, sends the same transcript
+The script transcribes Swedish speech with OpenAI, sends the same transcript
 and prompt to Claude and GPT, then prints the resulting cards side by side.
 """
 from __future__ import annotations
@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("wav", type=Path, help="Path to a Swedish word/phrase WAV clip")
     parser.add_argument(
         "--transcript",
-        help="Use an existing transcript and skip Whisper transcription.",
+        help="Use an existing transcript and skip audio transcription.",
     )
     parser.add_argument(
         "--skip-claude",
