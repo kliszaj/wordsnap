@@ -163,6 +163,7 @@ function renderQueue() {
   clips.forEach((clip) => {
     const node = queueTemplate.content.firstElementChild.cloneNode(true);
     node.dataset.clipId = clip.id;
+    node.classList.toggle("text-clip", !clip.stored_path);
     const item = node.querySelector(".queue-item");
     node.classList.toggle("active", clip.id === selectedClipId);
     item.classList.toggle("active", clip.id === selectedClipId);
@@ -216,7 +217,11 @@ function renderDetail() {
   status.className = statusClass(clip.status);
   status.textContent = statusLabel(clip.status);
   const detailAudio = node.querySelector(".audio");
-  detailAudio.src = `/api/clips/${clip.id}/audio`;
+  if (clip.stored_path) {
+    detailAudio.src = `/api/clips/${clip.id}/audio`;
+  } else {
+    node.classList.add("text-clip");
+  }
   detailAudio.addEventListener("play", () => queueAudio.pause());
 
   const transcript = node.querySelector(".transcript");
@@ -441,3 +446,39 @@ autoSyncInput?.addEventListener("change", async () => {
 });
 
 loadAutoSync();
+
+// ---- Text import (words without a recording, e.g. from Swedish Bootcamp) ----
+const importDialog = document.querySelector("#import-dialog");
+const importText = document.querySelector("#import-text");
+const importMsg = document.querySelector("#import-msg");
+const importSubmit = document.querySelector("#import-submit");
+
+document.querySelector("#import-open")?.addEventListener("click", () => {
+  importMsg.textContent = "";
+  importDialog.showModal();
+  importText.focus();
+});
+document.querySelector("#import-close")?.addEventListener("click", () => importDialog.close());
+
+importSubmit?.addEventListener("click", async () => {
+  const text = importText.value.trim();
+  if (!text) {
+    importMsg.textContent = "Paste at least one line.";
+    return;
+  }
+  importSubmit.disabled = true;
+  importMsg.textContent = "Importing…";
+  try {
+    const data = await request("/api/import-text", {
+      method: "POST",
+      body: JSON.stringify({ text, source: "import" }),
+    });
+    importMsg.textContent = `Imported ${data.count} ${data.count === 1 ? "line" : "lines"}. Cards are being made now.`;
+    importText.value = "";
+    await loadClips();
+  } catch (error) {
+    importMsg.textContent = `Could not import: ${error.message}`;
+  } finally {
+    importSubmit.disabled = false;
+  }
+});

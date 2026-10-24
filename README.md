@@ -53,6 +53,20 @@ Import and process:
 backend\.venv\Scripts\python.exe backend\process_folder.py test-clips --iso-week 2026-W28
 ```
 
+## Text Import
+
+Words you meet outside a recording (a textbook list, missed words from the Swedish Bootcamp
+vocab drill) can be added from the web UI with **Import text**, or by API:
+
+```text
+POST /api/import-text
+{"text": "en vistelse\ta stay\nförverkliga; to realise\nta upp ett ämne", "source": "bootcamp"}
+```
+
+One Swedish item per line, optionally followed by a meaning hint after a tab, `;` or ` - `.
+Each line becomes a text-only snip (no audio) that is enriched like a recording and saved to
+Anki when Auto-sync is on. `#` lines, blank lines and HTML tags are ignored; up to 200 lines per call.
+
 ## Anki Card Shape
 
 Front:
