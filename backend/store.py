@@ -108,6 +108,40 @@ def add_clip(source_path: Path, original_name: str, capture_timestamp: str | Non
     return clip
 
 
+def add_text_clip(text: str, hint: str = "", source: str = "text") -> dict[str, Any]:
+    """Create a clip from typed/pasted text instead of a WAV recording.
+
+    Text clips have no stored audio (`stored_path` is empty) and carry the text as
+    the transcript, so the normal enrichment + Anki pipeline can process them.
+    """
+    ensure_store()
+    clip_id = uuid.uuid4().hex[:12]
+    now = utc_now()
+    clip = {
+        "id": clip_id,
+        "status": "uploaded",
+        "source": source,
+        "original_name": f"{source}: {text[:60]}",
+        "stored_path": "",
+        "capture_timestamp": now,
+        "uploaded_at": now,
+        "updated_at": now,
+        "transcript": text,
+        "import_hint": hint,
+        "card_type": "",
+        "card_front": "",
+        "corrected_word": "",
+        "swedish_definition": "",
+        "english_definition": "",
+        "anki": None,
+        "error": "",
+    }
+    clips = load_clips()
+    clips.append(clip)
+    save_clips(clips)
+    return clip
+
+
 def import_folder(folder: Path, pattern: str = "rec_*.wav") -> list[dict[str, Any]]:
     added = []
     for wav in sorted(folder.glob(pattern)):

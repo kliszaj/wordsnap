@@ -41,7 +41,7 @@ def iso_week_from_datetime(value: datetime) -> str:
 
 
 def derive_clip_metadata(
-    wav_path: Path,
+    wav_path: Path | None,
     capture_timestamp: str | None = None,
     iso_week: str | None = None,
 ) -> tuple[str, str, bool]:

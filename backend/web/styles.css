@@ -914,3 +914,14 @@ textarea {
     flex-direction: column;
   }
 }
+
+#import-text {
+  width: 100%;
+  font: inherit;
+  resize: vertical;
+}
+
+.queue-row.text-clip .queue-play,
+.clip.text-clip .playback-strip {
+  visibility: hidden;
+}

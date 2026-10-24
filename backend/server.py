@@ -27,7 +27,7 @@ from compare import (
 )
 from enrich_claude import enrich_with_claude
 from enrich_openai import enrich_with_gpt, transcribe
-from store import DATA_DIR, add_clip, delete_clip, find_clip, load_clips, update_clip, utc_now
+from store import DATA_DIR, add_clip, add_text_clip, delete_clip, find_clip, load_clips, update_clip, utc_now
 
 import settings
 
@@ -58,6 +58,40 @@ class ProcessRequest(BaseModel):
     corrected_word: str | None = None
     iso_week: str | None = None
     capture_timestamp: str | None = None
+
+
+class ImportTextRequest(BaseModel):
+    text: str
+    source: str | None = None
+
+
+MAX_IMPORT_LINES = 200
+
+
+def parse_import_text(text: str) -> list[tuple[str, str]]:
+    """Parse pasted lines into (swedish_item, hint) pairs.
+
+    Accepts one item per line, optionally followed by a meaning/translation hint
+    separated by a tab, semicolon or " - " (e.g. a Swedish Bootcamp or Anki
+    plain-text export). Blank lines, '#' comment lines and HTML tags are ignored.
+    """
+    import re
+
+    items: list[tuple[str, str]] = []
+    for raw in text.splitlines():
+        line = re.sub(r"<[^>]+>", " ", raw).replace("&nbsp;", " ").strip()
+        if not line or line.startswith("#"):
+            continue
+        for sep in ("\t", ";", " - "):
+            if sep in line:
+                item, hint = line.split(sep, 1)
+                break
+        else:
+            item, hint = line, ""
+        item, hint = " ".join(item.split()), " ".join(hint.split())
+        if item:
+            items.append((item, hint))
+    return items[:MAX_IMPORT_LINES]
 
 
 class AutoSyncPatch(BaseModel):
@@ -361,6 +395,22 @@ async def upload_clip(
         temp_path.unlink(missing_ok=True)
 
 
+@app.post("/api/import-text")
+def import_text(payload: ImportTextRequest, background_tasks: BackgroundTasks) -> dict[str, Any]:
+    """Create text clips from pasted lines and process them like recorded snips
+    (enrich, then save to Anki when Auto-sync is on)."""
+    items = parse_import_text(payload.text)
+    if not items:
+        raise HTTPException(status_code=400, detail="No lines to import")
+    source = (payload.source or "text").strip()[:40] or "text"
+    created = []
+    for item, hint in items:
+        clip = add_text_clip(item, hint=hint, source=source)
+        background_tasks.add_task(auto_process_clip, clip["id"], clip["capture_timestamp"])
+        created.append(clip["id"])
+    return {"created": created, "count": len(created)}
+
+
 @app.post("/api/clips/{clip_id}/process")
 def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[str, Any]:
     request = request or ProcessRequest()
@@ -368,13 +418,16 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
     settings.apply_to_env()
 
     clip = find_clip(clip_id)
-    wav_path = Path(clip["stored_path"])
-    if not wav_path.exists():
+    is_text_clip = not clip.get("stored_path")
+    wav_path = Path(clip["stored_path"]) if not is_text_clip else None
+    if wav_path is not None and not wav_path.exists():
         raise HTTPException(status_code=404, detail="Stored WAV is missing")
 
     update_clip(clip_id, {"status": "processing", "error": ""})
     try:
         transcript = request.transcript or clip.get("transcript") or ""
+        if not transcript and is_text_clip:
+            raise HTTPException(status_code=400, detail="Text clip has no text to process")
         if not transcript:
             if not os.getenv("OPENAI_API_KEY"):
                 raise HTTPException(status_code=400, detail="OpenAI API key not configured. Add it in Settings.")
@@ -384,12 +437,14 @@ def process_clip(clip_id: str, request: ProcessRequest | None = None) -> dict[st
         enrichment_input = transcript
         if requested_front:
             enrichment_input = f"{transcript}\nTarget Swedish item correction from reviewer: {requested_front}"
+        if clip.get("import_hint"):
+            enrichment_input = f"{enrichment_input}\nMeaning hint from the learner (typed, not transcribed): {clip['import_hint']}"
 
         card, provider_used, fallback_error = enrich_with_fallback(enrichment_input)
 
         capture_timestamp, iso_week, _ = derive_clip_metadata(
             wav_path,
-            capture_timestamp=request.capture_timestamp or clip.get("capture_timestamp"),
+            capture_timestamp=request.capture_timestamp or clip.get("capture_timestamp") or (utc_now() if is_text_clip else None),
             iso_week=request.iso_week,
         )
         note = anki_note(card, iso_week)
@@ -497,6 +552,8 @@ def remove_clip(clip_id: str) -> Response:
 @app.get("/api/clips/{clip_id}/audio")
 def clip_audio(clip_id: str) -> FileResponse:
     clip = find_clip(clip_id)
+    if not clip.get("stored_path"):
+        raise HTTPException(status_code=404, detail="Text clip has no audio")
     return FileResponse(Path(clip["stored_path"]), media_type="audio/wav", filename=clip["original_name"])
 
 
